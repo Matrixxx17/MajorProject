@@ -1,0 +1,16 @@
+From HEAD Mon Sep 17 00:00:00 2001
+From: Hypothesis 6.140.2 <no-reply@hypothesis.works>
+Date: Wed, 24 Sep 2025 06:08:04
+Subject: [PATCH] Hypothesis: add explicit examples
+
+---
+--- ./generated_tests\test_properties.py
++++ ./generated_tests\test_properties.py
+@@ -3,6 +3,7 @@
+ import my_code
+ 
+ @given(st.integers())
++@example(n=1).via("discovered failure")
+ def test_is_even(n):
+     result = my_code.is_even(n)
+     assert result == (n % 2 == 0), f"Failed for input: {n}"
