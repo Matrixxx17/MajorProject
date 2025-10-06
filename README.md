@@ -1,4 +1,4 @@
-# 🚀 Codexter - AI Code Assistant
+# 🚀 Codexter - AI based code testing and refactoring tool
 
 An intelligent Chrome extension for AI-powered code testing and refactoring. Built with Plasmo, React, and TypeScript.
 
