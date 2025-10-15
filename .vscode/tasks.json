@@ -1,0 +1,31 @@
+﻿{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Pynguin: generate tests (calculator)",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-Command",
+        "$env:PYTHONPATH='src'; pynguin --project-path src --module-name simple_programs.calculator --output-path tests_generated --output-language pytest --algorithm MIO --maximum-search-time 120 --coverage-metric branch"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "Run tests (pytest)",
+      "type": "shell",
+      "command": "pytest tests_generated -q",
+      "problemMatcher": []
+    },
+    {
+      "label": "Run tests + coverage",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-Command",
+        "coverage run -m pytest tests_generated; coverage report -m; coverage html -d reports/coverage"
+      ],
+      "problemMatcher": []
+    }
+  ]
+}
