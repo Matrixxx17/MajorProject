@@ -1,0 +1,267 @@
+body {
+    width: 400px;
+    padding: 16px;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    margin: 0;
+}
+
+.container {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+h2 {
+    margin: 0;
+    font-size: 18px;
+}
+
+.upload-area {
+    border: 1px dashed #ccc;
+    padding: 20px;
+    border-radius: 8px;
+    text-align: center;
+    background-color: #f9f9f9;
+}
+
+input[type="file"] {
+    margin-bottom: 8px;
+    display: block;
+    width: 100%;
+}
+
+.hint {
+    font-size: 12px;
+    color: #666;
+    margin: 0;
+}
+
+button {
+    padding: 10px 16px;
+    background: #007bff;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    width: 100%;
+    font-weight: 600;
+}
+
+button:disabled {
+    background: #ccc;
+    cursor: not-allowed;
+}
+
+button.processing {
+    background: #a0c4ff;
+    cursor: wait;
+}
+
+.status {
+    margin-top: 8px;
+    padding: 8px;
+    border-radius: 4px;
+    font-size: 13px;
+    display: none;
+}
+
+.status.error {
+    background-color: #ffebee;
+    color: #c62828;
+    display: block;
+}
+
+.status.success {
+    background-color: #e8f5e9;
+    color: #2e7d32;
+    display: block;
+}
+
+.results-area {
+    margin-top: 8px;
+    max-height: 300px;
+    overflow-y: auto;
+}
+
+h3 {
+    font-size: 14px;
+    margin: 0 0 8px 0;
+}
+
+ul {
+    padding-left: 0;
+    list-style: none;
+    margin: 0;
+}
+
+li {
+    margin-bottom: 8px;
+    padding: 8px;
+    border: 1px solid #eee;
+    border-radius: 4px;
+    font-size: 13px;
+}
+
+.result-header {
+    font-weight: 600;
+    display: flex;
+    justify-content: space-between;
+}
+
+.result-status.success {
+    color: #48bb78;
+}
+
+.result-status.failed {
+    color: #f56565;
+}
+
+.result-status.error {
+    color: #f56565;
+}
+
+.result-status.pending {
+    color: #ed8936;
+}
+
+.result-status.skipped {
+    color: #a0aec0;
+}
+
+.btn.secondary-btn {
+    background: #4a5568;
+    margin-top: 10px;
+}
+
+.btn.secondary-btn:hover {
+    background: #2d3748;
+}
+
+.result-detail {
+    font-size: 11px;
+    margin-top: 4px;
+    color: #555;
+}
+
+.result-error {
+    font-size: 11px;
+    margin-top: 4px;
+    color: red;
+}
+
+/* Table Styles */
+.table-container {
+    overflow-x: auto;
+    margin-top: 10px;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+    background: white;
+}
+
+thead {
+    background: #f5f5f5;
+    font-weight: 600;
+}
+
+th {
+    padding: 8px;
+    text-align: left;
+    border-bottom: 2px solid #ddd;
+    font-size: 11px;
+    text-transform: uppercase;
+    color: #666;
+}
+
+td {
+    padding: 8px;
+    border-bottom: 1px solid #eee;
+}
+
+tr:hover {
+    background: #f9f9f9;
+}
+
+.file-cell {
+    font-weight: 500;
+    max-width: 120px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.test-file-cell {
+    font-size: 10px;
+    color: #666;
+    max-width: 150px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.error-cell {
+    font-size: 10px;
+    color: #f56565;
+    max-width: 150px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.status-badge {
+    padding: 3px 8px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 600;
+    display: inline-block;
+}
+
+.status-badge.status-success {
+    background: #c6f6d5;
+    color: #22543d;
+}
+
+.status-badge.status-failed,
+.status-badge.status-error {
+    background: #fed7d7;
+    color: #742a2a;
+}
+
+.status-badge.status-pending {
+    background: #feebc8;
+    color: #7c2d12;
+}
+
+.status-badge.status-skipped {
+    background: #e2e8f0;
+    color: #2d3748;
+}
+
+.metric-value {
+    font-weight: 600;
+    padding: 2px 6px;
+    border-radius: 3px;
+    display: inline-block;
+}
+
+.coverage-high {
+    background: #c6f6d5;
+    color: #22543d;
+}
+
+.coverage-medium {
+    background: #feebc8;
+    color: #7c2d12;
+}
+
+.coverage-low {
+    background: #fed7d7;
+    color: #742a2a;
+}
+
+.metric-na {
+    color: #a0aec0;
+    text-align: center;
+}

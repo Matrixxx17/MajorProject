@@ -1,0 +1,34 @@
+From HEAD Mon Sep 17 00:00:00 2001
+From: Hypothesis 6.140.2 <no-reply@hypothesis.works>
+Date: Sat, 15 Nov 2025 04:19:36
+Subject: [PATCH] Hypothesis: add explicit examples
+
+---
+--- ./generated_tests\test_properties.py
++++ ./generated_tests\test_properties.py
+@@ -13,6 +13,7 @@
+ 
+ @settings(max_examples=20, deadline=None)
+ @given(st.lists(st.text(min_size=1), min_size=0, max_size=10))
++@example(strings=["0"]).via("discovered failure")
+ def test_anagram_property(strings):
+     """Property test: anagram should accept list of strings and return dict-like values."""
+     try:
+@@ -27,6 +28,7 @@
+ 
+ @settings(max_examples=15, deadline=None)
+ @given(st.lists(st.text(min_size=1, max_size=5), min_size=1, max_size=5))
++@example(strings=["0"]).via("discovered failure")
+ def test_anagram_return_type(strings):
+     """Property test: anagram should return dict values."""
+     result = my_code_testable.anagram(strings)
+@@ -36,6 +38,9 @@
+ # Parametrized tests for anagram
+ @settings(max_examples=10, deadline=None)
+ @given(st.lists(st.text(min_size=1), min_size=2, max_size=3))
++@example(
++    strings=["0", "0"],  # or any other generated value
++).via("discovered failure")
+ def test_anagram_basic_grouping(strings):
+     """Parametrized test: anagram should group strings by character frequency."""
+     result = my_code_testable.anagram(strings)

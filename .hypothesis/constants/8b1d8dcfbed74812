@@ -1,0 +1,4 @@
+# file: C:\Users\asus\AppData\Roaming\Python\Python312\site-packages\libcst\_nodes\op.py
+# hypothesis_version: 6.140.2
+
+['!=', '%', '%=', '&', '&=', '*', '**', '**=', '*=', '+', '+=', ',', '-', '-=', '.', '/', '//', '//=', '/=', ':', ';', '<', '<<', '<<=', '<=', '<>', '=', '==', '>', '>=', '>>', '>>=', '@', '@=', 'BaseUnaryOp', 'NotEqual', '^', '^=', '_BaseOneTokenOp', '_BaseTwoTokenOp', 'and', 'in', 'is', 'not', 'or', 'whitespace_after', 'whitespace_before', 'whitespace_between', '|', '|=', '~']

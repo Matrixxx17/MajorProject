@@ -1,0 +1,4 @@
+# file: C:\Users\asus\AppData\Roaming\Python\Python312\site-packages\black\output.py
+# hypothesis_version: 6.140.2
+
+['\x1b[0m', '\x1b[1m', '\x1b[31m', '\x1b[32m', '\x1b[36m', '+', '+++', '-', '---', '.log', '@@', 'blk_', 'bold', 'cell_type', 'cells', 'code', 'fg', 'red', 'source', 'utf8', 'w']

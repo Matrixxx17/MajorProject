@@ -1,0 +1,4 @@
+# file: C:\Users\asus\AppData\Roaming\Python\Python312\site-packages\coverage\numbits.py
+# hypothesis_version: 6.140.2
+
+[b'\x00', 'num_in_numbits', 'numbits_intersection', 'numbits_to_nums', 'numbits_union']

@@ -1,0 +1,4 @@
+# file: C:\Users\asus\AppData\Roaming\Python\Python312\site-packages\libcst\codemod\visitors\_apply_type_annotations.py
+# hypothesis_version: 6.140.2
+
+[',', '.', 'Annotations', 'FunctionKey', 'Generic', 'Type', 'TypeCollector', 'TypeVar', '_', '__future__', 'annotations', 'builtins', 'typing', 'typing.Type', 'typing.TypeVar']

@@ -1,0 +1,4 @@
+# file: C:\Users\asus\AppData\Roaming\Python\Python312\site-packages\black\report.py
+# hypothesis_version: 6.140.2
+
+[123, ', ', '.', 'blue', 'failed to reformat', 'left unchanged', 'red', 'reformatted', 's', 'would be reformatted', 'would reformat']

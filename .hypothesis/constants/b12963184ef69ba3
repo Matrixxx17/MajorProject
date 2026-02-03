@@ -1,0 +1,4 @@
+# file: C:\Users\asus\AppData\Roaming\Python\Python312\site-packages\libcst\_parser\parso\python\py_token.py
+# hypothesis_version: 6.140.2
+
+['%s(%s)', 'ASYNC', 'AWAIT', 'DEDENT', 'ENDMARKER', 'ERRORTOKEN', 'ERROR_DEDENT', 'FSTRING_END', 'FSTRING_START', 'FSTRING_STRING', 'INDENT', 'NAME', 'NEWLINE', 'NUMBER', 'OP', 'STRING']

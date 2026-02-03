@@ -1,5 +1,5 @@
 --algorithm
-DYNAMOSA
+MIO
 --allow_stale_assertions
 False
 --any_weight
@@ -109,15 +109,15 @@ False
 --maximum_memory
 3000
 --maximum_search_time
--1
+180
 --maximum_slicing_time
 600
 --maximum_statement_executions
--1
+10000
 --maximum_test_execution_timeout
 5
 --maximum_test_executions
--1
+500
 --min_initial_tests
 1
 --minimization.test_case_minimization_direction
@@ -168,7 +168,7 @@ True
 --report_dir
 pynguin-report
 --seed
-1758694079412186500
+1763187227062375100
 --seed_from_archive
 False
 --seed_from_archive_mutations

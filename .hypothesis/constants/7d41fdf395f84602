@@ -1,0 +1,4 @@
+# file: C:\Users\asus\AppData\Roaming\Python\Python312\site-packages\libcst\_parser\parso\utils.py
+# hypothesis_version: 6.140.2
+
+[b'(?:[^\\n]*\\n){0,2}', b'coding[=:]\\s*([-\\w.]+)', b'utf-8', '%s.%s', '6', '7', 'PythonVersionInfo', '\\n|\\r\\n|\\r', "b'\\xef\\xbb\\xbf'", 'replace', 'strict', 'utf-8']

@@ -1,0 +1,4 @@
+# file: C:\Users\asus\AppData\Roaming\Python\Python312\site-packages\libcst\codemod\_cli.py
+# hypothesis_version: 6.140.2
+
+[100.0, 100, '\r\x1b[2K', ' with warnings\n', '*.py*', '.', 'Executing codemod...', 'Generated file.', '[calculating]', '_is_gil_enabled', 'py', 'pyi', 'rb', 'skipping!', 'utf-8', 'wb']

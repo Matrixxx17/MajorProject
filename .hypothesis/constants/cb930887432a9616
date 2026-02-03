@@ -1,0 +1,4 @@
+# file: C:\Users\asus\AppData\Roaming\Python\Python312\site-packages\pathspec\__init__.py
+# hypothesis_version: 6.140.2
+
+['GitIgnoreSpec', 'PathSpec', 'Pattern', 'RecursionError', 'RegexPattern', '__author__', '__copyright__', '__credits__', '__license__', '__version__', 'iter_tree', 'lookup_pattern', 'match_files']

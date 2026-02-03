@@ -1,0 +1,4 @@
+# file: C:\Users\asus\AppData\Roaming\Python\Python312\site-packages\libcst\codemod\visitors\_add_imports.py
+# hypothesis_version: 6.140.2
+
+['*', ', ', 'AddImportsVisitor', 'Logic error!', '__future__', '__strict__']

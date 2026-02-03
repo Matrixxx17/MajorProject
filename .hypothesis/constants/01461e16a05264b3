@@ -1,0 +1,4 @@
+# file: C:\Users\asus\AppData\Roaming\Python\Python312\site-packages\libcst\_batched_visitor.py
+# hypothesis_version: 6.140.2
+
+['CSTNode', '_is_no_op', 'leave_', 'visit_']

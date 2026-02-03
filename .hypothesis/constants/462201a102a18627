@@ -1,0 +1,4 @@
+# file: C:\Users\asus\AppData\Roaming\Python\Python312\site-packages\black\files.py
+# hypothesis_version: 6.140.2
+
+['*', ',', '-', '--', '.black', '.git', '.git directory', '.gitignore', '.hg', '.hg directory', '.ipynb', '/', '==', '===', '>', '>=', 'XDG_CONFIG_HOME', '_', 'black', 'colorama.AnsiToWin32', 'file system root', 'gitwildmatch', 'project', 'pyproject.toml', 'rb', 'requires-python', 'target_version', 'tool', 'utf-8', 'win32', '~/.config', '~=']

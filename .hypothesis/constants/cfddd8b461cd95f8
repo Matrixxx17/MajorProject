@@ -1,0 +1,4 @@
+# file: C:\Users\asus\AppData\Roaming\Python\Python312\site-packages\libcst\helpers\node_fields.py
+# hypothesis_version: 6.140.2
+
+['AssignEqual', 'Colon', 'Comma', 'Dot', 'Semicolon', 'Sentinel', '_', 'default_indent', 'default_newline', 'encoding', 'footer', 'has_trailing_newline', 'header', 'indent', 'leading_lines', 'posonly_ind', 'star', 'star_arg', 'whitespace']

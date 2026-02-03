@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Test Generator</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <div class="container">
+        <h2>Test Generator</h2>
+
+        <div class="upload-area">
+            <input type="file" id="fileInput" accept=".zip">
+            <p class="hint">Upload a .zip file containing Python code.</p>
+        </div>
+
+        <button id="uploadBtn" disabled>Generate Tests</button>
+
+        <div id="status" class="status"></div>
+
+        <div id="resultsArea" class="results-area" style="display: none;">
+            <h3>Results (<span id="resultCount">0</span>)</h3>
+            <div class="table-container">
+                <table id="resultsTable">
+                    <thead>
+                        <tr>
+                            <th>File</th>
+                            <th>Status</th>
+                            <th>Coverage</th>
+                            <th>Mutation</th>
+                            <th>Test File</th>
+                        </tr>
+                    </thead>
+                    <tbody id="resultsTableBody">
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    <script src="popup.js"></script>
+</body>
+
+</html>

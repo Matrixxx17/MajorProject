@@ -1,6 +1,6 @@
 project_path = "."
 module_name = "my_code"
-algorithm = "DYNAMOSA"
+algorithm = "MIO"
 ignore_modules = []
 ignore_methods = []
 subprocess = false
@@ -33,9 +33,9 @@ create_coverage_report = false
 type_guess_top_n = 10
 
 [stopping]
-maximum_search_time = -1
-maximum_test_executions = -1
-maximum_statement_executions = -1
+maximum_search_time = 180
+maximum_test_executions = 500
+maximum_statement_executions = 10000
 maximum_slicing_time = 600
 maximum_iterations = -1
 maximum_test_execution_timeout = 5
@@ -60,7 +60,7 @@ max_plateau_len = 25
 max_llm_interventions = 1
 
 [seeding]
-seed = 1758694079412186500
+seed = 1763187227062375100
 constant_seeding = true
 initial_population_seeding = false
 initial_population_data = ""

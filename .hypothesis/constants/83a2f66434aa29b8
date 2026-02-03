@@ -1,0 +1,4 @@
+# file: C:\Users\asus\AppData\Roaming\Python\Python312\site-packages\mypy_extensions.py
+# hypothesis_version: 6.140.2
+
+['NoReturn', 'TypedDict', '__annotations__', '__main__', '__module__', '__name__', '__new__', '__total__', 'abc', 'functools', 'total', 'typing']

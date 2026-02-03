@@ -1,0 +1,4 @@
+# file: C:\Users\asus\AppData\Roaming\Python\Python312\site-packages\libcst\metadata\__init__.py
+# hypothesis_version: 6.140.2
+
+['Access', 'Accesses', 'AccessorProvider', 'Assignment', 'Assignments', 'BaseAssignment', 'BaseMetadataProvider', 'BuiltinAssignment', 'BuiltinScope', 'ClassScope', 'CodePosition', 'CodeRange', 'CodeSpan', 'CodegenPartial', 'ComprehensionScope', 'ExpressionContext', 'FilePathProvider', 'FullRepoManager', 'FunctionScope', 'GlobalScope', 'ImportAssignment', 'MetadataWrapper', 'ParentNodeProvider', 'PositionProvider', 'ProviderT', 'QualifiedName', 'QualifiedNameSource', 'Scope', 'ScopeProvider']

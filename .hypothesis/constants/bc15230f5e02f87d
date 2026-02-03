@@ -1,0 +1,4 @@
+# file: C:\Users\asus\AppData\Roaming\Python\Python312\site-packages\libcst\_exceptions.py
+# hypothesis_version: 6.140.2
+
+['ParserSyntaxError', 'ParserSyntaxError(', 'lines', 'message', 'raw_column', 'raw_line']

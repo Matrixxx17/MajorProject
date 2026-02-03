@@ -9,15 +9,15 @@
  'minimization=Minimization(test_case_minimization_strategy=<MinimizationStrategy.CASE: '
  "'CASE'>, test_case_minimization_direction=<MinimizationDirection.BACKWARD: "
  "'BACKWARD'>), float_precision=0.01, format_with_black=True), "
- "algorithm=<Algorithm.DYNAMOSA: 'DYNAMOSA'>, "
+ "algorithm=<Algorithm.MIO: 'MIO'>, "
  "statistics_output=StatisticsOutputConfiguration(report_dir='pynguin-report', "
  "statistics_backend=<StatisticsBackend.CSV: 'CSV'>, "
  'timeline_interval=1000000000, timeline_interpolation=True, '
  "coverage_metrics=[<CoverageMetric.BRANCH: 'BRANCH'>], "
  "output_variables=[TargetModule, Coverage], configuration_id='', run_id='', "
  "project_name='', create_coverage_report=False, type_guess_top_n=10), "
- 'stopping=StoppingConfiguration(maximum_search_time=-1, '
- 'maximum_test_executions=-1, maximum_statement_executions=-1, '
+ 'stopping=StoppingConfiguration(maximum_search_time=180, '
+ 'maximum_test_executions=500, maximum_statement_executions=10000, '
  'maximum_slicing_time=600, maximum_iterations=-1, '
  'maximum_test_execution_timeout=5, maximum_coverage=100, '
  'maximum_coverage_plateau=-1, minimum_coverage=100, '
@@ -29,7 +29,7 @@
  'call_llm_for_uncovered_targets=False, coverage_threshold=1, '
  'call_llm_on_stall_detection=False, max_plateau_len=25, '
  'max_llm_interventions=1), '
- 'seeding=SeedingConfiguration(seed=1758694079412186500, '
+ 'seeding=SeedingConfiguration(seed=1763187227062375100, '
  'constant_seeding=True, initial_population_seeding=False, '
  "initial_population_data='', seeded_testcases_reuse_probability=0.9, "
  'initial_population_mutations=0, dynamic_constant_seeding=True, '

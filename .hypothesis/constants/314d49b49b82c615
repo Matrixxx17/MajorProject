@@ -1,0 +1,4 @@
+# file: C:\Users\asus\AppData\Roaming\Python\Python312\site-packages\libcst\_nodes\whitespace.py
+# hypothesis_version: 6.140.2
+
+['#[^\\r\\n]*', 'EmptyLine', 'TrailingWhitespace', '\\r\\n?|\\n', 'comment', 'empty_lines', 'first_line', 'last_line', 'newline', 'whitespace']

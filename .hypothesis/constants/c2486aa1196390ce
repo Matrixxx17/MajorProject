@@ -1,0 +1,4 @@
+# file: C:\Users\asus\AppData\Roaming\Python\Python312\site-packages\libcst\matchers\_matcher_base.py
+# hypothesis_version: 6.140.2
+
+[', ', 'AllOf[_MatcherT]', 'BaseMatcherNode', 'DoNotCare()', 'Logic error!', 'MatchMetadata', 'MatchMetadataIfTrue', 'OneOf[_MatcherT]', '_MatchIfTrueT', '_MatcherT', '_MatcherTypeT', '_MetadataValueT', '_OtherNodeT', '_metadata', 'metadata']
