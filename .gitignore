@@ -1,0 +1,70 @@
+# =====================
+# Python
+# =====================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Pytest / Hypothesis
+.pytest_cache/
+.hypothesis/
+
+# =====================
+# Test generation artifacts
+# =====================
+generated_tests/
+generated_tests_api/
+pynguin-report/
+
+# =====================
+# Coverage & reports
+# =====================
+.coverage
+coverage.*
+htmlcov/
+coverage.xml
+
+# =====================
+# IDE / Editor
+# =====================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# =====================
+# OS
+# =====================
+.DS_Store
+Thumbs.db
+
+# =====================
+# Logs
+# =====================
+*.log
+
+# =====================
+# Local runtime data
+# =====================
+uploads/
+*.db
+*.sqlite3
+
+# =====================
+# Environment variables
+# =====================
+.env
+.env.*
+
+# =====================
+# Build / cache
+# =====================
+build/
+dist/
+*.egg-info/

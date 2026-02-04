@@ -1,0 +1,60 @@
+# Node modules
+node_modules/
+.vscode-test/
+
+# Compiled output
+out/
+dist/
+*.vsix
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+
+# Backend specific
+backend/venv/
+backend/.env
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.mutmut-cache
+
+# Models
+models/trained_model/
+models/*.pth
+models/*.bin
+*.safetensors
+
+# Logs
+*.log
+logs/
+wandb/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+temp/
+.temp/
+
+# Test outputs
+test_*.py
+coverage.xml
+.pytest_cache/

@@ -710,6 +710,7 @@ class ControlFlowGraph(_bytecode.BaseBytecode):
         del block[index:]
 
         block2 = BasicBlock(instructions)
+        block2.next_block = block.next_block
         block.next_block = block2
 
         for block in self[block_index + 1 :]:
@@ -871,9 +872,7 @@ class ControlFlowGraph(_bytecode.BaseBytecode):
                     #   the new one since the blocks are disconnected.
                     if last_instr.is_final() and temp:
                         old_block.append(TryEnd(try_begins[active_try_begin][-1]))
-                        new_tb = TryBegin(
-                            active_try_begin.target, active_try_begin.push_lasti
-                        )
+                        new_tb = active_try_begin.copy()
                         block.append(new_tb)
                         # Add this new TryBegin to the map to properly update
                         # the target.

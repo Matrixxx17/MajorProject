@@ -11,6 +11,7 @@ Module, ClassDef, FunctionDef (and Lambda, GeneratorExp, DictComp and SetComp to
 
 from astroid.nodes.scoped_nodes.mixin import ComprehensionScope, LocalsDictNodeNG
 from astroid.nodes.scoped_nodes.scoped_nodes import (
+    SYNTHETIC_ROOT,
     AsyncFunctionDef,
     ClassDef,
     DictComp,
@@ -27,6 +28,7 @@ from astroid.nodes.scoped_nodes.scoped_nodes import (
 from astroid.nodes.scoped_nodes.utils import builtin_lookup
 
 __all__ = (
+    "SYNTHETIC_ROOT",
     "AsyncFunctionDef",
     "ClassDef",
     "ComprehensionScope",

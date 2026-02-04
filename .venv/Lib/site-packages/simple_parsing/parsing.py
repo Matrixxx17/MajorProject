@@ -13,9 +13,10 @@ import sys
 import typing
 from argparse import SUPPRESS, Action, HelpFormatter, Namespace, _
 from collections import defaultdict
+from collections.abc import Sequence
 from logging import getLogger
 from pathlib import Path
-from typing import Any, Callable, Sequence, Type, overload
+from typing import Any, Callable, overload
 
 from simple_parsing.helpers.subgroups import SubgroupKey
 from simple_parsing.wrappers.dataclass_wrapper import DataclassWrapperType
@@ -263,7 +264,7 @@ class ArgumentParser(argparse.ArgumentParser):
                 raise ValueError(
                     f"`dataclass` should be a dataclass type or instance. Got {dataclass}."
                 )
-            dataclass = typing.cast(Type[DataclassT], dataclass)
+            dataclass = typing.cast(type[DataclassT], dataclass)
             dataclass_type = dataclass
             default = default
 
@@ -1007,6 +1008,7 @@ def parse(
     dest: str = "config",
     *,
     prefix: str = "",
+    add_help: bool = True,
     nested_mode: NestedMode = NestedMode.WITHOUT_ROOT,
     conflict_resolution: ConflictResolution = ConflictResolution.AUTO,
     add_option_string_dash_variants: DashVariant = DashVariant.AUTO,
@@ -1027,7 +1029,7 @@ def parse(
 
     parser = ArgumentParser(
         nested_mode=nested_mode,
-        add_help=True,
+        add_help=add_help,
         config_path=config_path,
         conflict_resolution=conflict_resolution,
         add_option_string_dash_variants=add_option_string_dash_variants,
@@ -1055,6 +1057,7 @@ def parse_known_args(
     dest: str = "config",
     attempt_to_reorder: bool = False,
     *,
+    add_help: bool = True,
     nested_mode: NestedMode = NestedMode.WITHOUT_ROOT,
     conflict_resolution: ConflictResolution = ConflictResolution.AUTO,
     add_option_string_dash_variants: DashVariant = DashVariant.AUTO,
@@ -1074,7 +1077,7 @@ def parse_known_args(
         args = shlex.split(args)
     parser = ArgumentParser(
         nested_mode=nested_mode,
-        add_help=True,
+        add_help=add_help,
         # add_config_path_arg=None,
         config_path=config_path,
         conflict_resolution=conflict_resolution,

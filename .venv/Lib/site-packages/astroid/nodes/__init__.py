@@ -50,6 +50,7 @@ from astroid.nodes.node_classes import (
     IfExp,
     Import,
     ImportFrom,
+    Interpolation,
     JoinedStr,
     Keyword,
     List,
@@ -76,6 +77,7 @@ from astroid.nodes.node_classes import (
     Slice,
     Starred,
     Subscript,
+    TemplateStr,
     Try,
     TryStar,
     Tuple,
@@ -93,6 +95,7 @@ from astroid.nodes.node_classes import (
     unpack_infer,
 )
 from astroid.nodes.scoped_nodes import (
+    SYNTHETIC_ROOT,
     AsyncFunctionDef,
     ClassDef,
     ComprehensionScope,
@@ -202,6 +205,7 @@ ALL_NODE_CLASSES = (
 
 __all__ = (
     "CONST_CLS",
+    "SYNTHETIC_ROOT",
     "AnnAssign",
     "Arguments",
     "Assert",
@@ -245,6 +249,7 @@ __all__ = (
     "IfExp",
     "Import",
     "ImportFrom",
+    "Interpolation",
     "JoinedStr",
     "Keyword",
     "Lambda",
@@ -276,6 +281,7 @@ __all__ = (
     "Slice",
     "Starred",
     "Subscript",
+    "TemplateStr",
     "Try",
     "TryStar",
     "Tuple",

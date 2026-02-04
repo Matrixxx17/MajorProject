@@ -7,35 +7,30 @@ from typing import Optional
 import ast
 import textwrap
 
+ALLOWED_MODELS = {
+    "deepseek-coder:1.3b",
+    "codellama:7b"
+}
+
 def generate_tests_ollama(code: str, model: str = "deepseek-coder:1.3b", timeout: int = 60) -> Optional[str]:
     """
     Generate test cases using Ollama LLM.
     
     Args:
         code: Source code to generate tests for
-        model: Ollama model name (default: starcoder)
+        model: Ollama model name
         timeout: Maximum time to wait for response (seconds)
     
     Returns:
         Generated test code as string, or None if failed
     """
-    is_starcoder = "starcoder" in model
-    
-    if is_starcoder:
+    if model not in ALLOWED_MODELS:
+        raise ValueError(
+            f"Unsupported model '{model}'. "
+            f"Allowed models: {', '.join(ALLOWED_MODELS)}"
+        )
+
         # Completion prompt for StarCoder
-        prompt = f"""<filename>test_{model}.py
-# Imports
-import pytest
-import sys
-# Code to test
-{code}
-
-# Instructions: Write comprehensive pytest test cases for the above code.
-# Include edge cases (empty inputs, None), happy paths, and error handling.
-# Begin:
-import pytest
-
-def test_"""
     else:
         # Chat prompt for DeepSeek/Llama
         prompt = f"""You are a Senior QA Engineer. Your task is to write comprehensive `pytest` test cases for the following Python code.
@@ -219,7 +214,9 @@ if __name__ == "__main__":
     print(f"Source: {src_file}")
     print(f"Model: starcoder")
     
-    tests = generate_tests_ollama(code, model="deepseek-coder:1.3b")
+    model = sys.argv[3] if len(sys.argv) > 3 else "deepseek-coder:1.3b"
+    tests = generate_tests_ollama(code, model=model)
+
 
     if tests:
         out_file = output_dir / f"test_{module_name}_ollama.py"
