@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  backend:
+    build: .
+    container_name: pynguin-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - OLLAMA_URL=http://ollama:11434
+    depends_on:
+      - ollama
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - pynguin-network
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama-server
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - pynguin-network
+    restart: unless-stopped
+    # Pull the model on startup
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        ollama serve &
+        sleep 5
+        ollama pull codellama
+        wait
+
+volumes:
+  ollama-data:
+    driver: local
+
+networks:
+  pynguin-network:
+    driver: bridge

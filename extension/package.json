@@ -1,0 +1,61 @@
+{
+  "name": "pynguin-test-generator",
+  "displayName": "Pynguin Test Generator",
+  "description": "Generate unit tests using Pynguin and LLM refinement",
+  "version": "1.0.0",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Testing",
+    "Programming Languages"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "pynguin-test-gen-container",
+          "title": "Pynguin Test Generator",
+          "icon": "$(beaker)"
+        }
+      ]
+    },
+    "views": {
+      "pynguin-test-gen-container": [
+        {
+          "type": "webview",
+          "id": "pynguin-test-gen.testGeneratorView",
+          "name": "Test Generator"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "pynguin-test-gen.openView",
+        "title": "Open Pynguin Test Generator",
+        "category": "Pynguin"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src --ext ts",
+    "test": "node ./out/test/runTest.js"
+  },
+  "devDependencies": {
+    "@types/axios": "^0.9.36",
+    "@types/node": "16.x",
+    "@types/vscode": "^1.75.0",
+    "@typescript-eslint/eslint-plugin": "^5.45.0",
+    "@typescript-eslint/parser": "^5.45.0",
+    "eslint": "^8.28.0",
+    "typescript": "^4.9.3"
+  },
+  "dependencies": {
+    "axios": "^1.12.2"
+  }
+}
