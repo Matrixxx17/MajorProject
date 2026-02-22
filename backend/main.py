@@ -1,17 +1,23 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import subprocess
 import tempfile
 import os
 import ast
 import json
+import zipfile
+import uuid
+import shutil
+import time
+import threading
 from pathlib import Path
 import requests
-import coverage
-import pytest
+import traceback
+import sys
 
-app = FastAPI(title="Test Generator")
+app = FastAPI(title="Codexter Test Generator")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,490 +27,652 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-class TestGenerationRequest(BaseModel):
+# ── Directory setup ────────────────────────────────────────────────────────────
+BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_FOLDER  = os.path.join(BASE_DIR, "uploads")
+EXTRACT_FOLDER = os.path.join(BASE_DIR, "extracted_source")
+TESTS_FOLDER   = os.path.join(BASE_DIR, "generated_tests")
+
+for d in (UPLOAD_FOLDER, EXTRACT_FOLDER, TESTS_FOLDER):
+    os.makedirs(d, exist_ok=True)
+
+# ── In-memory job store ────────────────────────────────────────────────────────
+jobs: dict = {}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Pydantic models
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SingleFileRequest(BaseModel):
     code: str
     module_name: str
     directory: str
     file_path: str
-    ollama_model: str = "deepseek-coder:1.3b"
-    ollama_url: str = "http://localhost:11434"
-    pynguin_timeout: int = 60
-    mutation_threshold: float = 0.3
+    ollama_model:   str = "deepseek-coder:1.3b"
+    ollama_url:     str = "http://localhost:11434"
+    ollama_timeout: int = 120
 
-class TestGenerationResponse(BaseModel):
+class SingleFileResponse(BaseModel):
     tests: str
-    mutation_score: float
     coverage: float
+    mutation_score: float
     message: str
-    pynguin_tests: str = None
-    refined_tests: str = None
     pipeline_log: list = []
 
-class PynguinTestGenerator:
-    def __init__(self, temp_dir: str):
-        self.temp_dir = temp_dir
-        self.output_dir = os.path.join(temp_dir, "pynguin_output")
-        os.makedirs(self.output_dir, exist_ok=True)
-    
-    def generate_tests(self, code: str, module_name: str, timeout: int = 60) -> tuple[str, list]:
-        """Generate tests using Pynguin with comprehensive logging"""
-        logs = []
-        
-        # Write code to temporary file
-        module_file = os.path.join(self.temp_dir, f"{module_name}.py")
-        with open(module_file, 'w') as f:
-            f.write(code)
-        
-        logs.append(f"Created module file: {module_file}")
-        
-        # Create __init__.py for proper module structure
-        init_file = os.path.join(self.temp_dir, "__init__.py")
-        with open(init_file, 'w') as f:
-            f.write("")
-        
-        try:
-            cmd = [
-                "pynguin",
-                "--project-path", self.temp_dir,
-                "--module-name", module_name,
-                "--output-path", self.output_dir,
-                "--maximum-search-time", str(timeout),
-                "--assertion-generation", "MUTATION_ANALYSIS",
-                "--algorithm", "MOSA",  # Many-objective sorting algorithm
-                "--create-coverage-report", "TRUE",
-                "--show-progress", "FALSE",
-            ]
-            
-            logs.append(f"Running Pynguin command: {' '.join(cmd)}")
-            
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout + 10,
-                cwd=self.temp_dir
-            )
-            
-            logs.append(f"Pynguin stdout: {result.stdout[:500]}")
-            
-            if result.returncode != 0:
-                logs.append(f"Pynguin stderr: {result.stderr}")
-                raise Exception(f"Pynguin failed with return code {result.returncode}")
-            
-            # Read generated test file
-            test_file = os.path.join(self.output_dir, f"test_{module_name}.py")
-            if os.path.exists(test_file):
-                with open(test_file, 'r') as f:
-                    test_content = f.read()
-                logs.append(f"Generated test file with {len(test_content)} characters")
-                return test_content, logs
-            else:
-                # Try alternative naming
-                test_files = list(Path(self.output_dir).glob("test_*.py"))
-                if test_files:
-                    with open(test_files[0], 'r') as f:
-                        test_content = f.read()
-                    logs.append(f"Found alternative test file: {test_files[0]}")
-                    return test_content, logs
-                else:
-                    raise Exception("Pynguin did not generate test file")
-                
-        except subprocess.TimeoutExpired:
-            logs.append("Pynguin execution timed out")
-            raise Exception("Pynguin execution timed out")
-        except Exception as e:
-            logs.append(f"Error running Pynguin: {str(e)}")
-            raise Exception(f"Error running Pynguin: {str(e)}")
+class RefactorRequest(BaseModel):
+    code: str
+    module_name: str
+    file_path: str
+    ollama_model:   str = "deepseek-coder:1.3b"
+    ollama_url:     str = "http://localhost:11434"
+    ollama_timeout: int = 120
 
-class CoverageAnalyzer:
-    def __init__(self, temp_dir: str):
-        self.temp_dir = temp_dir
-    
-    def calculate_coverage(self, module_name: str, test_file: str) -> tuple[float, list]:
-        """Calculate code coverage using coverage.py"""
-        logs = []
-        
-        try:
-            # Write test file
-            test_path = os.path.join(self.temp_dir, f"test_{module_name}.py")
-            with open(test_path, 'w') as f:
-                f.write(test_file)
-            
-            logs.append(f"Written test file to: {test_path}")
-            
-            # Initialize coverage
-            cov = coverage.Coverage(
-                source=[self.temp_dir],
-                omit=['*/test_*.py', '*/__pycache__/*']
-            )
-            
-            cov.start()
-            
-            # Run tests with pytest
-            pytest_args = [
-                test_path,
-                "-v",
-                "--tb=short"
-            ]
-            
-            logs.append(f"Running pytest: {' '.join(pytest_args)}")
-            
-            result = pytest.main(pytest_args)
-            
-            cov.stop()
-            cov.save()
-            
-            # Get coverage data
-            total = cov.report()
-            
-            logs.append(f"Coverage calculated: {total}%")
-            
-            return total / 100.0, logs
-            
-        except Exception as e:
-            logs.append(f"Coverage calculation failed: {str(e)}")
-            return 0.0, logs
+class RefactorResponse(BaseModel):
+    refactored_code: str
+    summary: str
+    message: str
 
-class MutationTester:
-    def __init__(self, temp_dir: str):
-        self.temp_dir = temp_dir
-    
-    def run_mutation_testing(self, module_name: str, test_code: str) -> tuple[dict, list]:
-        """Run mutation testing using mutmut"""
-        logs = []
-        
-        # Write test file
-        test_file = os.path.join(self.temp_dir, f"test_{module_name}.py")
-        with open(test_file, 'w') as f:
-            f.write(test_code)
-        
-        logs.append(f"Written test file for mutation testing")
-        
-        try:
-            # First, run the tests to ensure they pass
-            pytest_result = subprocess.run(
-                ["pytest", test_file, "-v"],
-                cwd=self.temp_dir,
-                capture_output=True,
-                text=True,
-                timeout=60
-            )
-            
-            if pytest_result.returncode != 0:
-                logs.append(f"Tests failed before mutation: {pytest_result.stdout}")
-                return {
-                    "mutation_score": 0.0,
-                    "details": "Tests must pass before mutation testing"
-                }, logs
-            
-            logs.append("Tests passed, starting mutation testing")
-            
-            # Run mutmut
-            subprocess.run(
-                ["mutmut", "run", "--paths-to-mutate", f"{module_name}.py", "--no-progress"],
-                cwd=self.temp_dir,
-                capture_output=True,
-                timeout=120
-            )
-            
-            # Get results
-            result = subprocess.run(
-                ["mutmut", "results"],
-                cwd=self.temp_dir,
-                capture_output=True,
-                text=True
-            )
-            
-            logs.append(f"Mutation results: {result.stdout[:300]}")
-            
-            # Parse mutation score
-            output = result.stdout
-            score = self._parse_mutation_score(output)
-            
-            return {
-                "mutation_score": score,
-                "details": output
-            }, logs
-            
-        except subprocess.TimeoutExpired:
-            logs.append("Mutation testing timed out")
-            return {
-                "mutation_score": 0.0,
-                "details": "Mutation testing timed out"
-            }, logs
-        except Exception as e:
-            logs.append(f"Mutation testing failed: {str(e)}")
-            return {
-                "mutation_score": 0.0,
-                "details": str(e)
-            }, logs
-    
-    def _parse_mutation_score(self, output: str) -> float:
-        """Parse mutation score from mutmut output"""
-        try:
-            # Look for pattern like "10 killed, 2 survived"
-            lines = output.split('\n')
-            killed = 0
-            total = 0
-            
-            for line in lines:
-                if 'killed' in line.lower():
-                    parts = line.split()
-                    for i, part in enumerate(parts):
-                        if 'killed' in part.lower() and i > 0:
-                            try:
-                                killed = int(parts[i-1])
-                            except:
-                                pass
-                if 'survived' in line.lower():
-                    parts = line.split()
-                    for i, part in enumerate(parts):
-                        if 'survived' in part.lower() and i > 0:
-                            try:
-                                survived = int(parts[i-1])
-                                total = killed + survived
-                            except:
-                                pass
-            
-            if total > 0:
-                return killed / total
-            
-            # Fallback: look for percentage
-            for line in lines:
-                if '%' in line:
-                    parts = line.split()
-                    for part in parts:
-                        if '%' in part:
-                            try:
-                                return float(part.strip('%')) / 100
-                            except:
-                                pass
-            
-            return 0.5  # Default fallback
-            
-        except Exception as e:
-            print(f"Error parsing mutation score: {e}")
-            return 0.5
 
-class LLMRefiner:
-    def __init__(self, ollama_url: str, model: str):
-        self.ollama_url = ollama_url
-        self.model = model
-    
-    def refine_tests(self, original_code: str, pynguin_tests: str, mutation_score: float) -> tuple[str, list]:
-        """Use Ollama to refine Pynguin-generated tests"""
-        logs = []
-        
-        prompt = f"""You are an expert Python test engineer. Analyze and improve the following test code.
+# ══════════════════════════════════════════════════════════════════════════════
+# Ollama helpers
+# ══════════════════════════════════════════════════════════════════════════════
 
-Original Code:
+def call_ollama(prompt: str, ollama_url: str, model: str, timeout: int) -> str:
+    """Send a prompt to Ollama and return the raw response text."""
+    response = requests.post(
+        f"{ollama_url}/api/generate",
+        json={
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": 0.2,
+                "top_p": 0.9,
+                "num_predict": 2048,
+            },
+        },
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    return response.json().get("response", "")
+
+
+def generate_tests_ollama(
+    code: str,
+    module_name: str,
+    context: str = "",
+    ollama_url: str = "http://localhost:11434",
+    model: str = "deepseek-coder:1.3b",
+    timeout: int = 120,
+) -> str:
+    """Ask Ollama to write pytest tests for the given code."""
+    context_block = f"\n\n# Context from other project files:\n{context}" if context else ""
+    prompt = f"""You are an expert Python test engineer. Write comprehensive pytest tests for the following Python module.
+
+Module name: {module_name}
+
+Source code:
 ```python
-{original_code}
+{code}{context_block}
 ```
 
-Generated Tests (by Pynguin):
+Requirements:
+1. Use pytest framework only
+2. Import the module correctly using `from {module_name} import *` or specific imports
+3. Test all public functions and classes
+4. Cover edge cases and boundary conditions
+5. Use descriptive test function names: test_<function>_<scenario>
+6. Add a one-line docstring to each test function
+7. Use pytest.mark.parametrize for similar test cases
+8. Use pytest.raises for exception testing
+9. Return ONLY valid, executable Python — no markdown fences, no explanations
+
+Start your response directly with `import pytest`."""
+
+    raw = call_ollama(prompt, ollama_url, model, timeout)
+    return _clean_code(raw)
+
+
+def refactor_code_ollama(
+    code: str,
+    module_name: str,
+    ollama_url: str = "http://localhost:11434",
+    model: str = "deepseek-coder:1.3b",
+    timeout: int = 120,
+) -> tuple[str, str]:
+    """Ask Ollama to refactor the code. Returns (refactored_code, summary)."""
+    prompt = f"""You are an expert Python software engineer specialising in clean code and refactoring.
+
+Refactor the following Python module to improve:
+- Readability and clarity
+- Code structure and organisation
+- Performance where obvious improvements exist
+- PEP 8 compliance
+- Type hints (add where missing)
+- Docstrings (add where missing)
+- Removal of dead code or redundancy
+
+Module: {module_name}
+
 ```python
-{pynguin_tests}
+{code}
 ```
 
-Current Mutation Score: {mutation_score:.2%}
+Respond in exactly two sections, using these exact headers:
 
-Please improve these tests by:
-1. Adding more meaningful assertion messages explaining what is being tested
-2. Simplifying redundant test cases while maintaining coverage
-3. Improving test function names to be more descriptive (use test_<function>_<scenario> pattern)
-4. Adding comprehensive docstrings to explain what each test validates
-5. Ensuring assertions are semantically meaningful and test the right behavior
-6. Removing any unnecessary or duplicate tests
-7. Adding edge case tests for boundary conditions if missing
-8. Ensuring proper setup and teardown if needed
-9. Using appropriate pytest fixtures if beneficial
-10. Adding parametrize decorators for similar test cases
+REFACTORED_CODE:
+```python
+<the complete refactored module here>
+```
 
-Return ONLY the improved Python test code as valid, executable Python. Do not include markdown formatting, explanations, or comments outside the code."""
+SUMMARY:
+<bullet-point list of changes made>"""
 
+    raw = call_ollama(prompt, ollama_url, model, timeout)
+    return _parse_refactor_response(raw, code)
+
+
+def _parse_refactor_response(raw: str, original: str) -> tuple[str, str]:
+    code_part    = original
+    summary_part = "No summary provided."
+
+    if "REFACTORED_CODE:" in raw and "SUMMARY:" in raw:
+        parts        = raw.split("SUMMARY:", 1)
+        summary_part = parts[1].strip()
+        code_section = parts[0].split("REFACTORED_CODE:", 1)[1].strip()
+        code_part    = _clean_code(code_section)
+    else:
+        cleaned = _clean_code(raw)
+        if cleaned:
+            code_part = cleaned
+
+    return code_part, summary_part
+
+
+def _clean_code(raw: str) -> str:
+    """Strip markdown fences from an LLM code response."""
+    lines = raw.strip().split("\n")
+    cleaned, in_block, found_fence = [], False, False
+
+    for line in lines:
+        s = line.strip()
+        if s.startswith("```python"):
+            in_block, found_fence = True, True
+            continue
+        if s.startswith("```") and in_block:
+            in_block = False
+            continue
+        if s.startswith("```") and not found_fence:
+            in_block, found_fence = True, True
+            continue
+        if not found_fence or in_block:
+            cleaned.append(line)
+
+    result = "\n".join(cleaned).strip()
+    return result if result else raw
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Project context extraction  (mirrors Flask get_file_context)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_file_context(target_file: str, all_files: list) -> str:
+    """Build a compact API summary of all project files except the target."""
+    context = []
+    for fp in all_files:
+        if fp == target_file:
+            continue
         try:
-            logs.append(f"Sending request to Ollama at {self.ollama_url}")
-            
-            response = requests.post(
-                f"{self.ollama_url}/api/generate",
-                json={
-                    "model": self.model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                        "temperature": 0.2,
-                        "top_p": 0.9,
-                        "num_predict": 2048,
-                    }
-                },
-                timeout=180
-            )
-            
-            logs.append(f"Ollama response status: {response.status_code}")
-            
-            if response.status_code == 200:
-                result = response.json()
-                refined_code = result.get("response", "")
-                
-                logs.append(f"Received {len(refined_code)} characters from LLM")
-                
-                # Clean up the response
-                refined_code = self._clean_code_response(refined_code)
-                
-                # Validate it's valid Python
-                try:
-                    ast.parse(refined_code)
-                    logs.append("LLM generated valid Python code")
-                    return refined_code, logs
-                except SyntaxError as e:
-                    logs.append(f"LLM generated invalid Python: {str(e)}")
-                    logs.append("Falling back to original Pynguin tests")
-                    return pynguin_tests, logs
-            else:
-                logs.append(f"Ollama request failed: {response.text}")
-                return pynguin_tests, logs
-                
-        except requests.exceptions.Timeout:
-            logs.append("LLM request timed out")
-            return pynguin_tests, logs
-        except Exception as e:
-            logs.append(f"LLM refinement failed: {str(e)}")
-            return pynguin_tests, logs
-    
-    def _clean_code_response(self, code: str) -> str:
-        """Remove markdown code blocks and extra text"""
-        lines = code.strip().split('\n')
-        
-        # Remove markdown code fences
-        cleaned_lines = []
-        in_code_block = False
-        
-        for line in lines:
-            stripped = line.strip()
-            
-            if stripped.startswith('```python') or stripped.startswith('```'):
-                in_code_block = not in_code_block
-                continue
-            
-            if in_code_block or not stripped.startswith('```'):
-                cleaned_lines.append(line)
-        
-        result = '\n'.join(cleaned_lines).strip()
-        
-        # If we got empty result, return original
-        if not result:
-            return code
-        
-        return result
+            with open(fp, "r", encoding="utf-8") as f:
+                content = f.read()
+            tree = ast.parse(content)
+            rel  = os.path.basename(fp)
+            summary = [f"# File: {rel}"]
 
-@app.post("/generate-tests", response_model=TestGenerationResponse)
-async def generate_tests(request: TestGenerationRequest):
-    """
-    Main endpoint for test generation pipeline:
-    1. Generate tests with Pynguin
-    2. Calculate coverage
-    3. Run mutation testing
-    4. Refine tests with LLM if quality threshold met
-    """
-    
-    all_logs = []
-    
-    with tempfile.TemporaryDirectory() as temp_dir:
-        try:
-            # Step 1: Generate tests with Pynguin
-            all_logs.append("=== Step 1: Pynguin Test Generation ===")
-            pynguin_gen = PynguinTestGenerator(temp_dir)
-            pynguin_tests, pynguin_logs = pynguin_gen.generate_tests(
-                request.code,
-                request.module_name,
-                request.pynguin_timeout
-            )
-            all_logs.extend(pynguin_logs)
-            
-            # Step 2: Calculate coverage
-            all_logs.append("\n=== Step 2: Coverage Analysis ===")
-            coverage_analyzer = CoverageAnalyzer(temp_dir)
-            coverage_score, coverage_logs = coverage_analyzer.calculate_coverage(
-                request.module_name,
-                pynguin_tests
-            )
-            all_logs.extend(coverage_logs)
-            
-            # Step 3: Run mutation testing
-            all_logs.append("\n=== Step 3: Mutation Testing ===")
-            mutation_tester = MutationTester(temp_dir)
-            mutation_results, mutation_logs = mutation_tester.run_mutation_testing(
-                request.module_name,
-                pynguin_tests
-            )
-            all_logs.extend(mutation_logs)
-            
-            mutation_score = mutation_results["mutation_score"]
-            
-            # Step 4: Refine with LLM if mutation score meets threshold
-            refined_tests = pynguin_tests
-            if mutation_score >= request.mutation_threshold:
-                all_logs.append(f"\n=== Step 4: LLM Refinement (score {mutation_score:.2%} >= {request.mutation_threshold:.2%}) ===")
-                llm_refiner = LLMRefiner(request.ollama_url, request.ollama_model)
-                refined_tests, llm_logs = llm_refiner.refine_tests(
-                    request.code,
-                    pynguin_tests,
-                    mutation_score
+            doc = ast.get_docstring(tree)
+            if doc:
+                summary.append(f'"""{doc}"""')
+
+            for node in ast.walk(tree):
+                if isinstance(node, ast.FunctionDef) and not node.name.startswith("_"):
+                    args = [a.arg for a in node.args.args]
+                    line = f"def {node.name}({', '.join(args)}):"
+                    fn_doc = ast.get_docstring(node)
+                    if fn_doc:
+                        line += f"  # {fn_doc.splitlines()[0]}"
+                    summary.append(line)
+                elif isinstance(node, ast.ClassDef) and not node.name.startswith("_"):
+                    summary.append(f"class {node.name}:")
+                    cls_doc = ast.get_docstring(node)
+                    if cls_doc:
+                        summary.append(f'    """{cls_doc.splitlines()[0]}"""')
+                    for item in node.body:
+                        if isinstance(item, ast.FunctionDef):
+                            m_args = [a.arg for a in item.args.args]
+                            m_line = f"    def {item.name}({', '.join(m_args)}):"
+                            m_doc  = ast.get_docstring(item)
+                            if m_doc:
+                                m_line += f"  # {m_doc.splitlines()[0]}"
+                            summary.append(m_line)
+
+            if len(summary) > 1:
+                context.append("\n".join(summary))
+        except Exception:
+            pass
+
+    return "\n\n".join(context)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Metrics
+# ══════════════════════════════════════════════════════════════════════════════
+
+def calculate_coverage(module_path: str, test_path: str, work_dir: str) -> tuple[float, list]:
+    logs = []
+    try:
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "pytest", test_path,
+                f"--cov={module_path}",
+                "--cov-report=json",
+                "-v", "--tb=short", "-p", "no:cacheprovider",
+            ],
+            cwd=work_dir,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={**os.environ, "PYTHONPATH": work_dir},
+        )
+        logs.append(f"pytest exit code: {result.returncode}")
+
+        cov_json = os.path.join(work_dir, "coverage.json")
+        if os.path.exists(cov_json):
+            with open(cov_json) as f:
+                data = json.load(f)
+            pct = data.get("totals", {}).get("percent_covered", 0.0)
+            logs.append(f"Coverage: {pct:.1f}%")
+            return pct / 100.0, logs
+
+        for line in result.stdout.split("\n"):
+            if "TOTAL" in line:
+                for part in line.split():
+                    if part.endswith("%"):
+                        try:
+                            return float(part.rstrip("%")) / 100.0, logs
+                        except ValueError:
+                            pass
+
+        logs.append("Could not parse coverage — defaulting to 0.0")
+        return 0.0, logs
+
+    except subprocess.TimeoutExpired:
+        logs.append("Coverage timed out")
+        return 0.0, logs
+    except Exception as e:
+        logs.append(f"Coverage error: {e}")
+        return 0.0, logs
+
+
+def calculate_mutation_score(module_name: str, test_path: str, work_dir: str) -> tuple[float, list]:
+    logs = []
+    try:
+        pre = subprocess.run(
+            [sys.executable, "-m", "pytest", test_path, "--tb=short", "-p", "no:cacheprovider"],
+            cwd=work_dir, capture_output=True, text=True, timeout=60,
+            env={**os.environ, "PYTHONPATH": work_dir},
+        )
+        if pre.returncode != 0:
+            logs.append("Tests failed pre-mutation — skipping mutmut, using default score 0.3")
+            return 0.3, logs
+
+        subprocess.run(
+            [sys.executable, "-m", "mutmut", "run",
+             "--paths-to-mutate", f"{module_name}.py", "--no-progress"],
+            cwd=work_dir, capture_output=True, text=True, timeout=120,
+            env={**os.environ, "PYTHONPATH": work_dir},
+        )
+
+        res = subprocess.run(
+            [sys.executable, "-m", "mutmut", "results"],
+            cwd=work_dir, capture_output=True, text=True,
+            env={**os.environ, "PYTHONPATH": work_dir},
+        )
+        logs.append(f"mutmut output: {res.stdout[:300]}")
+        score = _parse_mutation_score(res.stdout)
+        logs.append(f"Mutation score: {score:.2%}")
+        return score, logs
+
+    except subprocess.TimeoutExpired:
+        logs.append("Mutation testing timed out — using default 0.3")
+        return 0.3, logs
+    except Exception as e:
+        logs.append(f"Mutation error: {e}")
+        return 0.3, logs
+
+
+def _parse_mutation_score(output: str) -> float:
+    killed, survived = 0, 0
+    for line in output.split("\n"):
+        parts = line.split()
+        for i, part in enumerate(parts):
+            if "killed" in part.lower() and i > 0:
+                try: killed = int(parts[i - 1])
+                except (ValueError, IndexError): pass
+            if "survived" in part.lower() and i > 0:
+                try: survived = int(parts[i - 1])
+                except (ValueError, IndexError): pass
+    total = killed + survived
+    if total > 0:
+        return killed / total
+    for line in output.split("\n"):
+        for part in line.split():
+            if part.endswith("%"):
+                try: return float(part.rstrip("%")) / 100
+                except ValueError: pass
+    return 0.5
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ZIP background worker  (mirrors Flask process_zip_job)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def process_zip_job(
+    job_id: str,
+    zip_path: str,
+    extract_path: str,
+    model: str,
+    ollama_url: str,
+    timeout: int,
+):
+    jobs[job_id]["status"]   = "processing"
+    jobs[job_id]["progress"] = 0
+    jobs[job_id]["results"]  = []
+
+    try:
+        with zipfile.ZipFile(zip_path, "r") as z:
+            z.extractall(extract_path)
+
+        python_files = [
+            os.path.join(root, f)
+            for root, _, files in os.walk(extract_path)
+            for f in files
+            if f.endswith(".py") and not f.startswith("test_")
+        ]
+
+        total = len(python_files)
+        jobs[job_id]["total_files"] = total
+
+        if total == 0:
+            jobs[job_id]["status"]  = "completed"
+            jobs[job_id]["message"] = "No Python files found in ZIP."
+            return
+
+        for i, py_file in enumerate(python_files):
+            file_name   = os.path.basename(py_file)
+            module_name = os.path.splitext(file_name)[0]
+            jobs[job_id]["current_file"] = file_name
+
+            with open(py_file, "r", encoding="utf-8") as f:
+                code = f.read()
+
+            context = get_file_context(py_file, python_files)
+            entry   = {"file": file_name, "status": "pending"}
+
+            try:
+                tests = generate_tests_ollama(
+                    code=code,
+                    module_name=module_name,
+                    context=context,
+                    ollama_url=ollama_url,
+                    model=model,
+                    timeout=timeout,
                 )
-                all_logs.extend(llm_logs)
-            else:
-                all_logs.append(f"\n=== Step 4: Skipping LLM Refinement (score {mutation_score:.2%} < {request.mutation_threshold:.2%}) ===")
-            
-            all_logs.append("\n=== Pipeline Complete ===")
-            
-            return TestGenerationResponse(
-                tests=refined_tests,
-                mutation_score=mutation_score,
-                coverage=coverage_score,
-                message=f"Successfully generated tests. Coverage: {coverage_score:.2%}, Mutation Score: {mutation_score:.2%}",
-                pynguin_tests=pynguin_tests,
-                refined_tests=refined_tests if refined_tests != pynguin_tests else None,
-                pipeline_log=all_logs
-            )
-            
-        except Exception as e:
-            all_logs.append(f"\n=== ERROR: {str(e)} ===")
-            raise HTTPException(
-                status_code=500,
-                detail={
-                    "error": str(e),
-                    "logs": all_logs
-                }
-            )
+                if not tests or not tests.strip():
+                    raise ValueError("Ollama returned empty tests")
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "service": "Pynguin Test Generator",
-        "version": "1.0.0"
+                ast.parse(tests)   # validate syntax
+
+                out_name = f"test_{module_name}.py"
+                out_path = os.path.join(TESTS_FOLDER, out_name)
+                with open(out_path, "w", encoding="utf-8") as tf:
+                    tf.write(tests)
+
+                # Metrics (best-effort; don't fail the job if they error)
+                try:
+                    cov,  cov_logs = calculate_coverage(py_file, out_path, extract_path)
+                    mut,  mut_logs = calculate_mutation_score(module_name, out_path, extract_path)
+                    metrics_summary = {
+                        "coverage_percent": round(cov * 100, 2),
+                        "mutation_score":   round(mut, 4),
+                        "has_errors":       False,
+                    }
+                except Exception as me:
+                    cov_logs = mut_logs = []
+                    metrics_summary = {"coverage_percent": 0.0, "mutation_score": 0.0, "has_errors": True}
+
+                entry.update({
+                    "status":    "success",
+                    "test_file": out_name,
+                    "full_path": out_path,
+                    "content":   tests,
+                    "metrics":   metrics_summary,
+                })
+
+            except SyntaxError as e:
+                entry["status"] = "failed"
+                entry["error"]  = f"LLM returned invalid Python: {e}"
+            except Exception as e:
+                entry["status"] = "failed"
+                entry["error"]  = str(e)
+
+            jobs[job_id]["results"].append(entry)
+            jobs[job_id]["progress"] = int(((i + 1) / total) * 100)
+
+        # Bundle results into a downloadable ZIP
+        results_zip = os.path.join(UPLOAD_FOLDER, f"tests_{job_id}.zip")
+        with zipfile.ZipFile(results_zip, "w") as zout:
+            for r in jobs[job_id]["results"]:
+                if r["status"] == "success" and "full_path" in r:
+                    zout.write(r["full_path"], r["test_file"])
+
+        jobs[job_id]["download_url"] = f"/download_tests/{job_id}"
+        jobs[job_id]["status"]       = "completed"
+        jobs[job_id]["message"]      = "Analysis complete"
+
+    except Exception as e:
+        jobs[job_id]["status"] = "error"
+        jobs[job_id]["error"]  = str(e)
+        print(traceback.format_exc())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Routes
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/generate-tests", response_model=SingleFileResponse)
+async def generate_tests_endpoint(req: SingleFileRequest):
+    """
+    Single-file test generation (used by the VSCode extension):
+    1. Generate tests via Ollama
+    2. Calculate coverage with pytest-cov
+    3. Calculate mutation score with mutmut
+    """
+    logs     = []
+    work_dir = tempfile.mkdtemp(prefix="codexter_")
+
+    try:
+        # Write source to temp dir so pytest can import it
+        src_path = os.path.join(work_dir, f"{req.module_name}.py")
+        with open(src_path, "w") as f:
+            f.write(req.code)
+        with open(os.path.join(work_dir, "__init__.py"), "w") as f:
+            f.write("")
+
+        # ── 1. Generate tests ──────────────────────────────────────────────
+        logs.append("=== Step 1: Ollama Test Generation ===")
+        try:
+            tests = generate_tests_ollama(
+                code=req.code,
+                module_name=req.module_name,
+                ollama_url=req.ollama_url,
+                model=req.ollama_model,
+                timeout=req.ollama_timeout,
+            )
+            if not tests or not tests.strip():
+                raise ValueError("Ollama returned an empty response")
+            ast.parse(tests)
+            logs.append(f"Generated {len(tests)} characters of test code")
+        except SyntaxError as e:
+            raise HTTPException(status_code=500, detail={
+                "error": f"LLM returned invalid Python syntax: {e}", "logs": logs})
+        except requests.exceptions.ConnectionError:
+            raise HTTPException(status_code=500, detail={
+                "error": f"Cannot connect to Ollama at {req.ollama_url}. Is it running?", "logs": logs})
+        except requests.exceptions.Timeout:
+            raise HTTPException(status_code=500, detail={
+                "error": "Ollama request timed out. Try a higher ollama_timeout.", "logs": logs})
+
+        # ── Write test file ────────────────────────────────────────────────
+        test_path = os.path.join(work_dir, f"test_{req.module_name}.py")
+        with open(test_path, "w") as f:
+            f.write(tests)
+
+        # ── 2. Coverage ────────────────────────────────────────────────────
+        logs.append("\n=== Step 2: Coverage Analysis ===")
+        coverage_score, cov_logs = calculate_coverage(src_path, test_path, work_dir)
+        logs.extend(cov_logs)
+
+        # ── 3. Mutation ────────────────────────────────────────────────────
+        logs.append("\n=== Step 3: Mutation Testing ===")
+        mutation_score, mut_logs = calculate_mutation_score(req.module_name, test_path, work_dir)
+        logs.extend(mut_logs)
+
+        logs.append("\n=== Pipeline Complete ===")
+
+        return SingleFileResponse(
+            tests=tests,
+            coverage=coverage_score,
+            mutation_score=mutation_score,
+            message=f"Tests generated. Coverage: {coverage_score:.1%}, Mutation: {mutation_score:.1%}",
+            pipeline_log=logs,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logs.append(f"\n=== ERROR: {e} ===")
+        logs.append(traceback.format_exc())
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail={"error": str(e), "logs": logs})
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+@app.post("/refactor", response_model=RefactorResponse)
+async def refactor_endpoint(req: RefactorRequest):
+    """Refactor a Python file using Ollama."""
+    try:
+        refactored, summary = refactor_code_ollama(
+            code=req.code,
+            module_name=req.module_name,
+            ollama_url=req.ollama_url,
+            model=req.ollama_model,
+            timeout=req.ollama_timeout,
+        )
+        return RefactorResponse(
+            refactored_code=refactored,
+            summary=summary,
+            message="Refactoring complete",
+        )
+    except requests.exceptions.ConnectionError:
+        raise HTTPException(status_code=500, detail={
+            "error": f"Cannot connect to Ollama at {req.ollama_url}"})
+    except Exception as e:
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+
+
+@app.post("/analyze_zip")
+async def analyze_zip(
+    file:           UploadFile = File(...),
+    ollama_model:   str = "deepseek-coder:1.3b",
+    ollama_url:     str = "http://localhost:11434",
+    ollama_timeout: int = 120,
+):
+    """
+    Upload a ZIP of Python source files.
+    Returns a job_id immediately; poll /status/{job_id} for progress.
+    Download results from /download_tests/{job_id} when complete.
+    """
+    if not file.filename.endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Only .zip files are accepted")
+
+    job_id  = str(uuid.uuid4())
+    job_dir = os.path.join(EXTRACT_FOLDER, job_id)
+    os.makedirs(job_dir)
+
+    zip_path = os.path.join(UPLOAD_FOLDER, f"{job_id}_{file.filename}")
+    contents = await file.read()
+    with open(zip_path, "wb") as f:
+        f.write(contents)
+
+    jobs[job_id] = {
+        "status":       "queued",
+        "submitted_at": time.time(),
+        "filename":     file.filename,
     }
 
+    thread = threading.Thread(
+        target=process_zip_job,
+        args=(job_id, zip_path, job_dir, ollama_model, ollama_url, ollama_timeout),
+        daemon=True,
+    )
+    thread.start()
+
+    return {"message": "Job submitted", "job_id": job_id}
+
+
+@app.get("/status/{job_id}")
+async def get_status(job_id: str):
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return jobs[job_id]
+
+
+@app.get("/download_tests/{job_id}")
+async def download_tests(job_id: str):
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    zip_path = os.path.join(UPLOAD_FOLDER, f"tests_{job_id}.zip")
+    if not os.path.exists(zip_path):
+        raise HTTPException(status_code=404, detail="Results ZIP not ready yet")
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename=f"generated_tests_{jobs[job_id]['filename']}.zip",
+    )
+
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "service": "Codexter", "version": "2.0.0"}
+
+
 @app.get("/ollama-status")
-async def check_ollama():
-    """Check if Ollama is available"""
+async def ollama_status(ollama_url: str = "http://localhost:11434"):
     try:
-        response = requests.get("http://localhost:11434/api/tags", timeout=5)
-        if response.status_code == 200:
-            models = response.json().get("models", [])
-            return {
-                "status": "connected",
-                "models": [m["name"] for m in models]
-            }
+        r = requests.get(f"{ollama_url}/api/tags", timeout=5)
+        if r.status_code == 200:
+            models = [m["name"] for m in r.json().get("models", [])]
+            return {"status": "connected", "models": models}
         return {"status": "error", "message": "Unexpected response"}
     except Exception as e:
         return {"status": "disconnected", "error": str(e)}
 
+
 if __name__ == "__main__":
     import uvicorn
-    print("Starting Pynguin Test Generator API...")
-    print("Backend: http://localhost:8000")
+    print("Starting Codexter API — http://localhost:8000")
     print("Docs: http://localhost:8000/docs")
     uvicorn.run(app, host="0.0.0.0", port=8000)
