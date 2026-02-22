@@ -1,7 +1,7 @@
 {
-  "name": "pynguin-test-generator",
-  "displayName": "Pynguin Test Generator",
-  "description": "Generate unit tests using Pynguin and LLM refinement",
+  "name": "codexter",
+  "displayName": "Codexter",
+  "description": "AI- based tool for code testing and refactoring",
   "version": "1.0.0",
   "engines": {
     "vscode": "^1.75.0"
@@ -15,26 +15,26 @@
     "viewsContainers": {
       "activitybar": [
         {
-          "id": "pynguin-test-gen-container",
-          "title": "Pynguin Test Generator",
+          "id": "codexter-container",
+          "title": "Codexter",
           "icon": "$(beaker)"
         }
       ]
     },
     "views": {
-      "pynguin-test-gen-container": [
+      "codexter-container": [
         {
           "type": "webview",
-          "id": "pynguin-test-gen.testGeneratorView",
-          "name": "Test Generator"
+          "id": "codexter.testGeneratorView",
+          "name": "Test Generator and Refactoring Tool"
         }
       ]
     },
     "commands": [
       {
-        "command": "pynguin-test-gen.openView",
-        "title": "Open Pynguin Test Generator",
-        "category": "Pynguin"
+        "command": "codexter.openView",
+        "title": "Open Codexter Test Generator and Refactor Tool",
+        "category": "Codexter"
       }
     ]
   },

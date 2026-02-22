@@ -37,3 +37,11 @@ htmlcov/
 dist/
 build/
 *.egg-info/
+
+#backend
+logs/
+extracted_source/
+generated_tests/
+tests/
+uploads/
+

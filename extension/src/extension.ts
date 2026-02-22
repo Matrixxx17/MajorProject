@@ -457,7 +457,7 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
 html,body{
   background:var(--bg);color:var(--text);
   font-family:var(--mono);font-size:11.5px;line-height:1.5;
-  overflow-x:hidden;min-height:100vh;
+  overflow-x:hidden;overflow-y:auto;min-height:100vh;
 }
 
 /* ─── Header ──────────────────────────────────────────────── */
@@ -499,7 +499,7 @@ html,body{
 }
 
 /* ─── Main panels ─────────────────────────────────────────── */
-.mpanel{display:none;padding:14px 15px}
+.mpanel{display:none;padding:14px 15px 0}
 .mpanel.on{display:block;animation:fup .22s var(--ease) forwards}
 
 /* ─── Inner sub-tabs (Single / Multiple / Codebase) ──────── */
@@ -524,7 +524,7 @@ html,body{
 
 /* ─── Sub-panels ──────────────────────────────────────────── */
 .spanel{display:none}
-.spanel.on{display:block;animation:fup .2s var(--ease) forwards}
+.spanel.on{display:block;animation:fup .2s var(--ease) forwards;padding-bottom:24px}
 
 /* ─── Backend row ─────────────────────────────────────────── */
 .backend-row{margin-bottom:12px}
@@ -682,7 +682,7 @@ input[type=text]::placeholder{color:var(--muted2)}
 
 /* ─── Results card ────────────────────────────────────────── */
 .result-card{
-  display:none;margin-top:13px;
+  display:none;margin-top:16px;
   background:var(--surf);border:1px solid var(--bd);border-radius:var(--r);
   overflow:hidden;
 }
@@ -705,7 +705,7 @@ input[type=text]::placeholder{color:var(--muted2)}
 
 /* ─── Multi results table ─────────────────────────────────── */
 .multi-table{
-  display:none;margin-top:13px;
+  display:none;margin-top:16px;
   background:var(--surf);border:1px solid var(--bd);border-radius:var(--r);overflow:hidden;
 }
 .multi-table.on{display:block;animation:fup .26s var(--ease) forwards}
@@ -729,7 +729,7 @@ input[type=text]::placeholder{color:var(--muted2)}
 
 /* ─── ZIP result ──────────────────────────────────────────── */
 .zip-result{
-  display:none;margin-top:13px;
+  display:none;margin-top:16px;
   background:var(--surf);border:1px solid var(--bd);border-radius:var(--r);
   overflow:hidden;
 }
@@ -759,7 +759,7 @@ input[type=text]::placeholder{color:var(--muted2)}
 .ref-sub{font-size:9.5px;color:var(--muted);margin-top:3px}
 
 .ref-result{
-  display:none;margin-top:13px;
+  display:none;margin-top:16px;
   background:var(--surf);border:1px solid var(--bd);border-radius:var(--r);overflow:hidden;
 }
 .ref-result.on{display:block;animation:fup .26s var(--ease) forwards}
