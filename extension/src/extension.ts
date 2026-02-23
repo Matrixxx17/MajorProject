@@ -9,16 +9,16 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(
       TestGeneratorViewProvider.viewType,
-      provider
-    )
+      provider,
+    ),
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("pynguin-test-gen.openView", () => {
+    vscode.commands.registerCommand("codexter.openView", () => {
       vscode.commands.executeCommand(
-        "workbench.view.extension.pynguin-test-gen-container"
+        "workbench.view.extension.codexter-container",
       );
-    })
+    }),
   );
 
   context.subscriptions.push(
@@ -26,12 +26,12 @@ export function activate(context: vscode.ExtensionContext) {
       if (editor && editor.document.uri.fsPath.endsWith(".py")) {
         provider.notifyActiveFileChanged(editor.document.uri.fsPath);
       }
-    })
+    }),
   );
 }
 
 class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
-  public static readonly viewType = "pynguin-test-gen.testGeneratorView";
+  public static readonly viewType = "codexter.testGeneratorView";
   private _view?: vscode.WebviewView;
 
   constructor(private readonly _extensionUri: vscode.Uri) {}
@@ -43,7 +43,7 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
   public resolveWebviewView(
     webviewView: vscode.WebviewView,
     _context: vscode.WebviewViewResolveContext,
-    _token: vscode.CancellationToken
+    _token: vscode.CancellationToken,
   ) {
     this._view = webviewView;
     webviewView.webview.options = {
@@ -57,7 +57,7 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
     if (active?.document.uri.fsPath.endsWith(".py")) {
       setTimeout(
         () => this.notifyActiveFileChanged(active.document.uri.fsPath),
-        300
+        300,
       );
     }
 
@@ -82,7 +82,7 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
           await this.handleSingleGeneration(
             msg.filePath,
             msg.dirPath,
-            msg.backendUrl
+            msg.backendUrl,
           );
           break;
         case "generateMultiple":
@@ -165,7 +165,7 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
   private async handleSingleGeneration(
     filePath: string,
     dirPath: string,
-    backendUrl: string
+    backendUrl: string,
   ) {
     const moduleName = path.basename(filePath, ".py");
     this._view?.webview.postMessage({
@@ -174,13 +174,18 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
     });
     try {
       const code = Buffer.from(
-        await vscode.workspace.fs.readFile(vscode.Uri.file(filePath))
+        await vscode.workspace.fs.readFile(vscode.Uri.file(filePath)),
       ).toString("utf8");
 
       const { data } = await axios.post(
         `${backendUrl}/generate-tests`,
-        { code, module_name: moduleName, directory: dirPath, file_path: filePath },
-        { timeout: 300000 }
+        {
+          code,
+          module_name: moduleName,
+          directory: dirPath,
+          file_path: filePath,
+        },
+        { timeout: 300000 },
       );
 
       this._view?.webview.postMessage({
@@ -201,7 +206,7 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
 
   private async handleMultipleGeneration(
     filePaths: string[],
-    backendUrl: string
+    backendUrl: string,
   ) {
     this._view?.webview.postMessage({
       type: "generationStarted",
@@ -223,13 +228,13 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
 
       try {
         const code = Buffer.from(
-          await vscode.workspace.fs.readFile(vscode.Uri.file(fp))
+          await vscode.workspace.fs.readFile(vscode.Uri.file(fp)),
         ).toString("utf8");
 
         const { data } = await axios.post(
           `${backendUrl}/generate-tests`,
           { code, module_name: moduleName, directory: dirPath, file_path: fp },
-          { timeout: 300000 }
+          { timeout: 300000 },
         );
 
         results.push({
@@ -242,7 +247,8 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
           moduleName,
         });
 
-        if (data.tests) await this.saveTestFile(dirPath, moduleName, data.tests, false);
+        if (data.tests)
+          await this.saveTestFile(dirPath, moduleName, data.tests, false);
       } catch (err) {
         results.push({
           file: path.basename(fp),
@@ -266,19 +272,19 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
     try {
       // Read ZIP as a Node Buffer — no Blob/FormData needed
       const zipBuffer = fs.readFileSync(zipPath);
-      const fileName  = path.basename(zipPath);
+      const fileName = path.basename(zipPath);
 
       // Build a minimal multipart/form-data body manually
       const boundary = `----CodBoundary${Date.now()}`;
-      const CRLF     = "\r\n";
+      const CRLF = "\r\n";
 
       const header = Buffer.from(
         `--${boundary}${CRLF}` +
-        `Content-Disposition: form-data; name="file"; filename="${fileName}"${CRLF}` +
-        `Content-Type: application/zip${CRLF}${CRLF}`
+          `Content-Disposition: form-data; name="file"; filename="${fileName}"${CRLF}` +
+          `Content-Type: application/zip${CRLF}${CRLF}`,
       );
       const footer = Buffer.from(`${CRLF}--${boundary}--${CRLF}`);
-      const body   = Buffer.concat([header, zipBuffer, footer]);
+      const body = Buffer.concat([header, zipBuffer, footer]);
 
       const { data } = await axios.post(`${backendUrl}/analyze_zip`, body, {
         headers: {
@@ -321,16 +327,19 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
     try {
       const moduleName = path.basename(filePath, ".py");
       const code = Buffer.from(
-        await vscode.workspace.fs.readFile(vscode.Uri.file(filePath))
+        await vscode.workspace.fs.readFile(vscode.Uri.file(filePath)),
       ).toString("utf8");
 
       const { data } = await axios.post(
         `${backendUrl}/refactor`,
         { code, module_name: moduleName, file_path: filePath },
-        { timeout: 300000 }
+        { timeout: 300000 },
       );
 
-      this._view?.webview.postMessage({ type: "refactorComplete", result: data });
+      this._view?.webview.postMessage({
+        type: "refactorComplete",
+        result: data,
+      });
 
       // Offer to overwrite the file with refactored code
       if (data.refactored_code) {
@@ -338,12 +347,12 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
           `Overwrite ${path.basename(filePath)} with refactored version?`,
           "Yes",
           "Save as new file",
-          "No"
+          "No",
         );
         if (answer === "Yes") {
           await vscode.workspace.fs.writeFile(
             vscode.Uri.file(filePath),
-            Buffer.from(data.refactored_code, "utf8")
+            Buffer.from(data.refactored_code, "utf8"),
           );
           vscode.window.showInformationMessage("File refactored successfully.");
         } else if (answer === "Save as new file") {
@@ -352,9 +361,11 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
           const newPath = path.join(dir, `${base}_refactored.py`);
           await vscode.workspace.fs.writeFile(
             vscode.Uri.file(newPath),
-            Buffer.from(data.refactored_code, "utf8")
+            Buffer.from(data.refactored_code, "utf8"),
           );
-          const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(newPath));
+          const doc = await vscode.workspace.openTextDocument(
+            vscode.Uri.file(newPath),
+          );
           await vscode.window.showTextDocument(doc);
         }
       }
@@ -372,7 +383,7 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
     dirPath: string,
     moduleName: string,
     testCode: string,
-    prompt = true
+    prompt = true,
   ) {
     const testFileName = `test_${moduleName}.py`;
     const testFilePath = path.join(dirPath, testFileName);
@@ -382,7 +393,7 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
       const answer = await vscode.window.showInformationMessage(
         `Save ${testFileName}?`,
         "Yes",
-        "No"
+        "No",
       );
       save = answer === "Yes";
     }
@@ -390,11 +401,11 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
     if (save) {
       await vscode.workspace.fs.writeFile(
         vscode.Uri.file(testFilePath),
-        Buffer.from(testCode, "utf8")
+        Buffer.from(testCode, "utf8"),
       );
       if (prompt) {
         const doc = await vscode.workspace.openTextDocument(
-          vscode.Uri.file(testFilePath)
+          vscode.Uri.file(testFilePath),
         );
         await vscode.window.showTextDocument(doc);
       }
