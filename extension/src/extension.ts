@@ -3,6 +3,8 @@ import * as path from "path";
 import * as fs from "fs";
 import axios from "axios";
 
+const BACKEND_URL = "http://localhost:8000";
+
 export function activate(context: vscode.ExtensionContext) {
   const provider = new TestGeneratorViewProvider(context.extensionUri);
 
@@ -75,27 +77,26 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
           await this.pickZipFile();
           break;
         case "generateSingle":
-          await this.handleSingleGeneration(
-            msg.filePath,
-            msg.dirPath,
-            msg.backendUrl,
-          );
+          await this.handleSingleGeneration(msg.filePath, msg.dirPath);
           break;
         case "generateZip":
           await this.handleZipGeneration(
             msg.zipPath,
-            msg.backendUrl,
             msg.analysisMode ?? "single",
           );
           break;
         case "pollJob":
-          await this.pollJob(msg.jobId, msg.backendUrl, msg.scope);
+          await this.pollJob(msg.jobId, msg.scope);
           break;
         case "checkBackend":
-          await this.checkBackend(msg.backendUrl);
+          await this.checkBackend();
           break;
-        case "refactorCode":
-          await this.handleRefactoring(msg.filePath, msg.backendUrl);
+        // Unified refactor: one message per model, webview sequences ensemble
+        case "refactorSingleModel":
+          await this.handleRefactorSingleModel(msg.filePath, msg.model);
+          break;
+        case "saveRefactored":
+          await this.saveRefactoredFile(msg.filePath, msg.code, msg.model);
           break;
       }
     });
@@ -143,13 +144,9 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  // ── Generation handlers ─────────────────────────────────────────────────────
+  // ── Test Generation handlers ────────────────────────────────────────────────
 
-  private async handleSingleGeneration(
-    filePath: string,
-    dirPath: string,
-    backendUrl: string,
-  ) {
+  private async handleSingleGeneration(filePath: string, dirPath: string) {
     this._view?.webview.postMessage({
       type: "generationStarted",
       scope: "single",
@@ -163,7 +160,7 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
       const moduleName = path.basename(filePath, ".py");
 
       const { data } = await axios.post(
-        `${backendUrl}/generate-tests`,
+        `${BACKEND_URL}/generate-tests`,
         {
           code,
           module_name: moduleName,
@@ -177,20 +174,18 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
         type: "jobStarted",
         scope: "single",
         jobId: data.job_id,
-        backendUrl,
       });
     } catch (err) {
       this._view?.webview.postMessage({
         type: "generationError",
         scope: "single",
-        error: this.extractError(err, backendUrl),
+        error: this.extractError(err),
       });
     }
   }
 
   private async handleZipGeneration(
     zipPath: string,
-    backendUrl: string,
     analysisMode: "single" | "ensemble" = "single",
   ) {
     this._view?.webview.postMessage({
@@ -223,7 +218,7 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
         footer,
       ]);
 
-      const { data } = await axios.post(`${backendUrl}/analyze_zip`, body, {
+      const { data } = await axios.post(`${BACKEND_URL}/analyze_zip`, body, {
         headers: {
           "Content-Type": `multipart/form-data; boundary=${boundary}`,
           "Content-Length": body.length,
@@ -235,21 +230,20 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
         type: "jobStarted",
         scope: "zip",
         jobId: data.job_id,
-        backendUrl,
         analysisMode,
       });
     } catch (err) {
       this._view?.webview.postMessage({
         type: "generationError",
         scope: "zip",
-        error: this.extractError(err, backendUrl),
+        error: this.extractError(err),
       });
     }
   }
 
-  private async pollJob(jobId: string, backendUrl: string, scope: string) {
+  private async pollJob(jobId: string, scope: string) {
     try {
-      const { data } = await axios.get(`${backendUrl}/status/${jobId}`, {
+      const { data } = await axios.get(`${BACKEND_URL}/status/${jobId}`, {
         timeout: 10000,
       });
       this._view?.webview.postMessage({
@@ -266,11 +260,11 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async checkBackend(backendUrl: string) {
+  private async checkBackend() {
     let apiOk = false;
     let apiDetail = "";
     try {
-      const { data } = await axios.get(`${backendUrl}/health`, {
+      const { data } = await axios.get(`${BACKEND_URL}/health`, {
         timeout: 4000,
       });
       apiOk = data?.status === "healthy";
@@ -291,7 +285,7 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
     let ollamaModels: string[] = [];
     if (apiOk) {
       try {
-        const { data } = await axios.get(`${backendUrl}/ollama-status`, {
+        const { data } = await axios.get(`${BACKEND_URL}/ollama-status`, {
           timeout: 6000,
         });
         ollamaOk = data?.status === "connected";
@@ -324,8 +318,10 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  private async handleRefactoring(filePath: string, backendUrl: string) {
-    this._view?.webview.postMessage({ type: "refactorStarted" });
+  // ── Unified single-model refactor job ──────────────────────────────────────
+  // The webview drives ensemble sequencing: it fires one model at a time,
+  // waits for the job to complete, then fires the next.
+  private async handleRefactorSingleModel(filePath: string, model: string) {
     try {
       const moduleName = path.basename(filePath, ".py");
       const code = Buffer.from(
@@ -333,59 +329,78 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
       ).toString("utf8");
 
       const { data } = await axios.post(
-        `${backendUrl}/refactor`,
-        { code, module_name: moduleName, file_path: filePath },
-        { timeout: 300000 },
+        `${BACKEND_URL}/refactor-ppo`,
+        {
+          code,
+          module_name: moduleName,
+          file_path: filePath,
+          ollama_model: model,
+          ollama_url: "http://localhost:11434",
+        },
+        { timeout: 30000 },
       );
 
       this._view?.webview.postMessage({
-        type: "refactorComplete",
-        result: data,
+        type: "refactorJobStarted",
+        model,
+        jobId: data.job_id,
       });
-
-      if (data.refactored_code) {
-        const answer = await vscode.window.showInformationMessage(
-          `Overwrite ${path.basename(filePath)} with refactored version?`,
-          "Yes",
-          "Save as new file",
-          "No",
-        );
-        if (answer === "Yes") {
-          await vscode.workspace.fs.writeFile(
-            vscode.Uri.file(filePath),
-            Buffer.from(data.refactored_code, "utf8"),
-          );
-          vscode.window.showInformationMessage("File refactored successfully.");
-        } else if (answer === "Save as new file") {
-          const dir = path.dirname(filePath);
-          const base = path.basename(filePath, ".py");
-          const newPath = path.join(dir, `${base}_refactored.py`);
-          await vscode.workspace.fs.writeFile(
-            vscode.Uri.file(newPath),
-            Buffer.from(data.refactored_code, "utf8"),
-          );
-          const doc = await vscode.workspace.openTextDocument(
-            vscode.Uri.file(newPath),
-          );
-          await vscode.window.showTextDocument(doc);
-        }
-      }
     } catch (err) {
       this._view?.webview.postMessage({
-        type: "refactorError",
-        error: this.extractError(err, backendUrl),
+        type: "refactorJobError",
+        model,
+        error: this.extractError(err),
       });
+    }
+  }
+
+  private async saveRefactoredFile(
+    filePath: string,
+    code: string,
+    model: string,
+  ) {
+    try {
+      const answer = await vscode.window.showInformationMessage(
+        `Save refactored version (${model})?`,
+        "Overwrite original",
+        "Save as new file",
+        "Cancel",
+      );
+      if (answer === "Overwrite original") {
+        await vscode.workspace.fs.writeFile(
+          vscode.Uri.file(filePath),
+          Buffer.from(code, "utf8"),
+        );
+        vscode.window.showInformationMessage("File saved.");
+      } else if (answer === "Save as new file") {
+        const dir = path.dirname(filePath);
+        const base = path.basename(filePath, ".py");
+        const tag = model.split(":")[0].replace("deepseek-coder", "deepseek");
+        const newPath = path.join(dir, `${base}_refactored_${tag}.py`);
+        await vscode.workspace.fs.writeFile(
+          vscode.Uri.file(newPath),
+          Buffer.from(code, "utf8"),
+        );
+        const doc = await vscode.workspace.openTextDocument(
+          vscode.Uri.file(newPath),
+        );
+        await vscode.window.showTextDocument(doc);
+      }
+    } catch (err) {
+      vscode.window.showErrorMessage(
+        "Save failed: " + (err instanceof Error ? err.message : String(err)),
+      );
     }
   }
 
   // ── Helpers ─────────────────────────────────────────────────────────────────
 
-  private extractError(err: any, backendUrl: string): string {
+  private extractError(err: any): string {
     if (axios.isAxiosError(err)) {
       if (err.response?.data?.detail?.error)
         return err.response.data.detail.error;
       if (err.code === "ECONNREFUSED")
-        return `Cannot connect to backend at ${backendUrl}`;
+        return `Cannot connect to backend at ${BACKEND_URL}`;
       if (err.code === "ECONNABORTED") return "Request timed out";
       return err.message;
     }
@@ -419,7 +434,6 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
 html,body{background:var(--bg);color:var(--text);font-family:var(--mono);
   font-size:11.5px;line-height:1.5;overflow-x:hidden;overflow-y:auto;min-height:100vh;}
 
-/* Header */
 .hdr{padding:15px 15px 0;opacity:0;animation:fdown .38s var(--ease) .04s forwards}
 .wordmark{font-family:var(--sans);font-size:14px;font-weight:700;letter-spacing:.03em;
   display:flex;align-items:center;gap:8px;}
@@ -427,26 +441,22 @@ html,body{background:var(--bg);color:var(--text);font-family:var(--mono);
   box-shadow:0 0 9px var(--accent);animation:pulse 2.6s ease-in-out infinite;flex-shrink:0;}
 .tagline{font-size:9.5px;color:var(--muted);margin-top:3px;letter-spacing:.09em;text-transform:uppercase;}
 
-/* Connection bar */
 .conn-bar{display:flex;align-items:center;gap:6px;margin:10px 15px 0;padding:7px 10px;
   background:var(--surf);border:1px solid var(--bd);border-radius:var(--r);
   opacity:0;animation:fdown .38s var(--ease) .16s forwards;}
 .conn-item{display:flex;align-items:center;gap:5px;font-size:9.5px;color:var(--muted);flex:1;min-width:0;}
 .conn-sep{width:1px;height:12px;background:var(--bd2);flex-shrink:0}
-.conn-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;background:var(--muted2);
-  transition:background .25s,box-shadow .25s;}
-.conn-dot.ok {background:var(--green);box-shadow:0 0 6px rgba(62,207,110,.5)}
+.conn-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;background:var(--muted2);transition:background .25s,box-shadow .25s;}
+.conn-dot.ok{background:var(--green);box-shadow:0 0 6px rgba(62,207,110,.5)}
 .conn-dot.err{background:var(--red);box-shadow:0 0 6px rgba(240,112,112,.4)}
 .conn-dot.chk{background:var(--amber);animation:pulse .9s ease-in-out infinite}
 .conn-lbl{letter-spacing:.06em;text-transform:uppercase;font-size:8.5px}
-.conn-detail{font-size:8.5px;color:var(--muted2);overflow:hidden;text-overflow:ellipsis;
-  white-space:nowrap;flex:1}
+.conn-detail{font-size:8.5px;color:var(--muted2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
 .conn-recheck{margin-left:auto;padding:2px 6px;border:1px solid var(--bd2);border-radius:4px;
   background:transparent;color:var(--muted);font-family:var(--mono);font-size:8.5px;
   cursor:pointer;transition:color .14s,border-color .14s;flex-shrink:0;}
 .conn-recheck:hover{color:var(--text);border-color:var(--accent)}
 
-/* Outer tabs */
 .outer-tabs{display:flex;gap:2px;margin:14px 15px 0;background:var(--surf);
   border:1px solid var(--bd);border-radius:var(--r);padding:3px;
   opacity:0;animation:fdown .38s var(--ease) .1s forwards;}
@@ -456,11 +466,9 @@ html,body{background:var(--bg);color:var(--text);font-family:var(--mono);
 .otab:hover:not(.on){background:rgba(255,255,255,.04);color:var(--text)}
 .otab.on{background:var(--aclo);color:var(--accent2);border:1px solid var(--acbd);}
 
-/* Main panels */
 .mpanel{display:none;padding:14px 15px 0}
 .mpanel.on{display:block;animation:fup .22s var(--ease) forwards}
 
-/* Inner sub-tabs */
 .inner-tabs-wrap{background:var(--surf2);border:1px solid var(--bd);border-radius:var(--r);
   padding:3px;display:flex;gap:2px;margin-bottom:14px;}
 .itab{flex:1;padding:5px 2px;border:none;background:transparent;color:var(--muted);
@@ -470,24 +478,14 @@ html,body{background:var(--bg);color:var(--text);font-family:var(--mono);
 .itab.on{background:rgba(255,255,255,.06);color:var(--text);border:1px solid var(--bd2);
   box-shadow:inset 0 1px 0 rgba(255,255,255,.04);}
 
-/* Sub-panels */
 .spanel{display:none}
 .spanel.on{display:block;animation:fup .2s var(--ease) forwards;padding-bottom:24px}
 
-/* Labels */
 .lbl{font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);
   margin-bottom:5px;display:flex;align-items:center;gap:5px;}
 .lbl-badge{font-size:8.5px;padding:1px 5px;border-radius:20px;background:var(--aclo);
   color:var(--accent2);border:1px solid var(--acbd);letter-spacing:.04em;}
 
-/* Input */
-input[type=text]{width:100%;padding:7px 9px;background:var(--surf);color:var(--text);
-  border:1px solid var(--bd);border-radius:var(--r);font-family:var(--mono);font-size:11px;
-  outline:none;transition:border-color .17s,box-shadow .17s;}
-input[type=text]:focus{border-color:rgba(124,110,245,.45);box-shadow:0 0 0 3px rgba(124,110,245,.08);}
-input[type=text]::placeholder{color:var(--muted2)}
-
-/* File card */
 .file-card{background:var(--surf);border:1px solid var(--bd);border-radius:var(--r);
   padding:10px 12px;display:flex;align-items:flex-start;gap:9px;transition:border-color .17s;}
 .file-card.active{border-color:var(--acbd)}
@@ -503,7 +501,6 @@ input[type=text]::placeholder{color:var(--muted2)}
 .fc-dismiss.visible{display:flex;align-items:center;justify-content:center}
 .fc-dismiss:disabled{opacity:.25;cursor:not-allowed;pointer-events:none}
 
-/* Buttons */
 .btn{display:flex;align-items:center;justify-content:center;gap:6px;width:100%;
   padding:9px;border:none;border-radius:var(--r);font-family:var(--mono);font-size:11px;
   font-weight:600;letter-spacing:.04em;cursor:pointer;transition:all .18s var(--ease);
@@ -511,30 +508,25 @@ input[type=text]::placeholder{color:var(--muted2)}
 .btn::after{content:'';position:absolute;inset:0;background:#fff;opacity:0;transition:opacity .13s;}
 .btn:active:not(:disabled)::after{opacity:.05}
 .btn:disabled{opacity:.32;cursor:not-allowed;transform:none !important;box-shadow:none !important}
-.btn-violet{background:linear-gradient(135deg,var(--accent),#9b8af8);color:#fff;
-  box-shadow:0 3px 14px rgba(124,110,245,.3);}
+.btn-violet{background:linear-gradient(135deg,var(--accent),#9b8af8);color:#fff;box-shadow:0 3px 14px rgba(124,110,245,.3);}
 .btn-violet:hover:not(:disabled){box-shadow:0 5px 20px rgba(124,110,245,.44);transform:translateY(-1px);}
-.btn-green{background:linear-gradient(135deg,#16a34a,var(--green));color:#051a0e;
-  box-shadow:0 3px 14px rgba(62,207,110,.22);}
+.btn-green{background:linear-gradient(135deg,#16a34a,var(--green));color:#051a0e;box-shadow:0 3px 14px rgba(62,207,110,.22);}
 .btn-green:hover:not(:disabled){box-shadow:0 5px 20px rgba(62,207,110,.36);transform:translateY(-1px);}
-.btn-ghost{background:var(--surf);color:var(--muted);border:1px solid var(--bd);
-  width:auto;padding:7px 11px;font-size:11px;}
+.btn-amber{background:linear-gradient(135deg,#b45309,var(--amber));color:#0d0800;box-shadow:0 3px 14px rgba(245,166,35,.22);}
+.btn-amber:hover:not(:disabled){box-shadow:0 5px 20px rgba(245,166,35,.36);transform:translateY(-1px);}
+.btn-ghost{background:var(--surf);color:var(--muted);border:1px solid var(--bd);width:auto;padding:7px 11px;font-size:11px;}
 .btn-ghost:hover{color:var(--text);border-color:var(--bd2)}
 
-/* Helpers */
 .row{display:flex;gap:8px;align-items:flex-end;margin-bottom:12px}
-.mb{margin-bottom:12px}.fld{margin-bottom:12px}.divider{height:1px;background:var(--bd);margin:12px 0}
-.backend-row{margin-bottom:12px}
+.mb{margin-bottom:12px}.fld{margin-bottom:12px}
+.divider{height:1px;background:var(--bd);margin:12px 0}
 
-/* Loader */
 .loader{display:none;flex-direction:column;align-items:center;gap:10px;padding:18px 0 8px;}
 .loader.on{display:flex}
-.ring{width:22px;height:22px;border-radius:50%;border:2px solid var(--bd2);
-  border-top-color:var(--accent);animation:spin .7s linear infinite;}
+.ring{width:22px;height:22px;border-radius:50%;border:2px solid var(--bd2);border-top-color:var(--accent);animation:spin .7s linear infinite;}
 .ring.green{border-top-color:var(--green)}.ring.amber{border-top-color:var(--amber)}
 .loader-txt{font-size:10px;color:var(--muted);letter-spacing:.06em}
 
-/* Status pill */
 .pill{display:none;align-items:center;gap:7px;padding:8px 11px;border-radius:var(--r);font-size:11px;}
 .pill.on{display:flex;animation:fup .2s var(--ease) forwards}
 .pdot{width:5px;height:5px;border-radius:50%;flex-shrink:0}
@@ -545,45 +537,39 @@ input[type=text]::placeholder{color:var(--muted2)}
 .pill.err{background:var(--redlo);border:1px solid var(--redbd);color:var(--red)}
 .pill.err .pdot{background:var(--red)}
 
-/* Progress bar */
-.progress-wrap{background:var(--surf2);border:1px solid var(--bd);border-radius:20px;height:5px;
-  overflow:hidden;margin-bottom:6px;}
-.progress-bar{height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));
-  border-radius:20px;transition:width .4s var(--ease);width:0%;}
+.progress-wrap{background:var(--surf2);border:1px solid var(--bd);border-radius:20px;height:5px;overflow:hidden;margin-bottom:6px;}
+.progress-bar{height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));border-radius:20px;transition:width .4s var(--ease);width:0%;}
+.progress-bar.amber{background:linear-gradient(90deg,var(--amber),#f5c842);}
 .progress-label{font-size:9.5px;color:var(--muted);text-align:center;margin-bottom:8px}
 
-/* ── Pynguin algo results table ───────────────────────────────── */
+/* Test gen: algo table */
 .algo-section{display:none;margin-top:16px;}
 .algo-section.on{display:block;animation:fup .26s var(--ease) forwards}
 .section-hdr{font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);
   margin-bottom:8px;display:flex;align-items:center;gap:6px;}
 .section-hdr::after{content:'';flex:1;height:1px;background:var(--bd);}
-
 .algo-table{background:var(--surf);border:1px solid var(--bd);border-radius:var(--r);overflow:hidden;}
-.at-row{display:grid;grid-template-columns:90px 1fr 70px 70px 70px;gap:0;
-  align-items:center;border-bottom:1px solid var(--bd);font-size:10.5px;}
+.at-row{display:grid;grid-template-columns:90px 1fr 70px 70px 70px;gap:0;align-items:center;border-bottom:1px solid var(--bd);font-size:10.5px;}
 .at-row:last-child{border-bottom:none}
 .at-row.hd{background:var(--surf2);font-size:8.5px;color:var(--muted);letter-spacing:.08em;text-transform:uppercase;}
 .at-cell{padding:7px 10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .at-cell.right{text-align:right;}
-.algo-badge{display:inline-flex;align-items:center;padding:2px 7px;border-radius:4px;
-  font-size:8.5px;letter-spacing:.05em;font-weight:600;}
+.algo-badge{display:inline-flex;align-items:center;padding:2px 7px;border-radius:4px;font-size:8.5px;letter-spacing:.05em;font-weight:600;}
 .algo-badge.random{background:var(--aclo);color:var(--accent2);border:1px solid var(--acbd);}
 .algo-badge.whole_suite{background:var(--greenlo);color:var(--green);border:1px solid var(--greenbd);}
 .algo-badge.dynamosa{background:var(--amberlo);color:var(--amber);border:1px solid var(--amberbd);}
 .score-g{color:var(--green)}.score-a{color:var(--amber)}.score-r{color:var(--red)}.score-d{color:var(--muted)}
-.tag{display:inline-flex;align-items:center;justify-content:center;font-size:8.5px;
-  padding:2px 6px;border-radius:4px;letter-spacing:.04em;}
+.tag{display:inline-flex;align-items:center;justify-content:center;font-size:8.5px;padding:2px 6px;border-radius:4px;letter-spacing:.04em;}
 .tag.ok{background:var(--greenlo);color:var(--green);border:1px solid var(--greenbd)}
 .tag.err{background:var(--redlo);color:var(--red);border:1px solid var(--redbd)}
+.tag.ens{background:var(--amberlo);color:var(--amber);border:1px solid var(--amberbd)}
+.tag.run{background:var(--aclo);color:var(--accent2);border:1px solid var(--acbd)}
 
-/* ── Side-by-side code panels ─────────────────────────────────── */
 .code-section{display:none;margin-top:16px;}
 .code-section.on{display:block;animation:fup .26s var(--ease) forwards}
 .code-panels{display:grid;grid-template-columns:1fr 1fr;gap:8px;}
 .code-panel{background:var(--surf);border:1px solid var(--bd);border-radius:var(--r);overflow:hidden;}
-.cp-hdr{padding:7px 10px;border-bottom:1px solid var(--bd);display:flex;
-  align-items:center;justify-content:space-between;background:var(--surf2);}
+.cp-hdr{padding:7px 10px;border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between;background:var(--surf2);}
 .cp-title{font-size:8.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--muted)}
 .cp-badge{font-size:8px;padding:1px 5px;border-radius:3px;}
 .cp-badge.raw{background:var(--aclo);color:var(--accent2);border:1px solid var(--acbd);}
@@ -592,60 +578,102 @@ input[type=text]::placeholder{color:var(--muted2)}
 .cp-body pre{font-size:9.5px;line-height:1.65;white-space:pre-wrap;word-break:break-all;color:#bbbbd8}
 .cp-empty{color:var(--muted);font-style:italic;font-size:10px;padding:14px 10px;text-align:center;}
 
-/* ── DL link ──────────────────────────────────────────────────── */
 .dl-link{color:var(--accent2);text-decoration:none;font-size:9.5px;}
 .dl-link:hover{color:var(--accent)}
 
-/* ZIP result */
-.zip-result{display:none;margin-top:16px;background:var(--surf);border:1px solid var(--bd);
-  border-radius:var(--r);overflow:hidden;}
+.zip-result{display:none;margin-top:16px;background:var(--surf);border:1px solid var(--bd);border-radius:var(--r);overflow:hidden;}
 .zip-result.on{display:block;animation:fup .26s var(--ease) forwards}
-.zr-hdr{padding:8px 12px;border-bottom:1px solid var(--bd);display:flex;
-  align-items:center;justify-content:space-between}
+.zr-hdr{padding:8px 12px;border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between}
 .zr-title{font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
 .zr-body{padding:10px 12px;max-height:220px;overflow-y:auto}
-.zr-row{display:grid;grid-template-columns:1fr 46px 46px 52px 52px;gap:5px;
-  align-items:center;padding:5px 0;border-bottom:1px solid var(--bd);font-size:10.5px;}
+.zr-row{display:grid;grid-template-columns:1fr 46px 46px 52px 52px;gap:5px;align-items:center;padding:5px 0;border-bottom:1px solid var(--bd);font-size:10.5px;}
 .zr-row:last-child{border-bottom:none}
 .zr-row.hd{font-size:9px;color:var(--muted);letter-spacing:.07em;text-transform:uppercase}
 .mt-val{text-align:right}.mt-file{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.tag.ens{background:var(--amberlo);color:var(--amber);border:1px solid var(--amberbd)}
 
-/* Mode toggle */
-.mode-toggle{display:flex;gap:2px;margin-bottom:12px;background:var(--surf2);
-  border:1px solid var(--bd);border-radius:var(--r);padding:3px;}
-.mtog{flex:1;padding:6px 4px;border:none;background:transparent;color:var(--muted);
-  font-family:var(--mono);font-size:10px;font-weight:500;letter-spacing:.04em;cursor:pointer;
-  border-radius:5px;transition:all .17s var(--ease);display:flex;align-items:center;
-  justify-content:center;gap:5px;}
+.mode-toggle{display:flex;gap:2px;margin-bottom:12px;background:var(--surf2);border:1px solid var(--bd);border-radius:var(--r);padding:3px;}
+.mtog{flex:1;padding:6px 4px;border:none;background:transparent;color:var(--muted);font-family:var(--mono);font-size:10px;font-weight:500;letter-spacing:.04em;cursor:pointer;border-radius:5px;transition:all .17s var(--ease);display:flex;align-items:center;justify-content:center;gap:5px;}
 .mtog:hover:not(.on){background:rgba(255,255,255,.04);color:var(--text)}
 .mtog.on.single{background:var(--aclo);color:var(--accent2);border:1px solid var(--acbd);}
 .mtog.on.ensemble{background:var(--amberlo);color:var(--amber);border:1px solid var(--amberbd);}
-.mode-desc{font-size:9px;color:var(--muted);margin-bottom:10px;padding:6px 9px;
-  background:var(--surf2);border:1px solid var(--bd);border-radius:5px;line-height:1.6;}
+.mode-desc{font-size:9px;color:var(--muted);margin-bottom:10px;padding:6px 9px;background:var(--surf2);border:1px solid var(--bd);border-radius:5px;line-height:1.6;}
 .mode-desc .hi{color:var(--text)}
 
-/* Refactor panel */
+/* ── Refactor panel ── */
 .ref-file-card{background:var(--surf2);border:1px solid var(--bd);border-radius:var(--r);
   padding:11px 13px;margin-bottom:13px;display:flex;align-items:flex-start;gap:9px;}
-.ref-icon{font-size:16px;flex-shrink:0;line-height:1;padding-top:1px}
 .ref-body{flex:1;min-width:0}
 .ref-name{font-size:11px;color:var(--text);word-break:break-all;line-height:1.4}
 .ref-name.empty{color:var(--muted);font-style:italic}
 .ref-sub{font-size:9.5px;color:var(--muted);margin-top:3px}
-.ref-result{display:none;margin-top:16px;background:var(--surf);border:1px solid var(--bd);
-  border-radius:var(--r);overflow:hidden;}
-.ref-result.on{display:block;animation:fup .26s var(--ease) forwards}
-.rc-hdr{padding:8px 12px;border-bottom:1px solid var(--bd);display:flex;
-  align-items:center;justify-content:space-between;}
-.rc-title{font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
-.ref-summary{padding:11px 12px;font-size:10.5px;line-height:1.7;color:#c4c4e0;
-  border-bottom:1px solid var(--bd);white-space:pre-wrap}
 
-/* Scrollbar / Animations */
-::-webkit-scrollbar{width:3px}
-::-webkit-scrollbar-track{background:transparent}
-::-webkit-scrollbar-thumb{background:var(--bd2);border-radius:3px}
+/* Model checkboxes */
+.model-pick-wrap{background:var(--surf2);border:1px solid var(--bd);border-radius:var(--r);padding:10px 12px;margin-bottom:12px;}
+.model-pick-title{font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:8px;}
+.model-checks{display:flex;flex-direction:column;gap:5px;}
+.mc-row{display:grid;grid-template-columns:16px auto 1fr auto;align-items:center;gap:8px;
+  cursor:pointer;padding:7px 9px;border-radius:5px;border:1px solid transparent;transition:all .15s;}
+.mc-row:hover{background:rgba(255,255,255,.03);border-color:var(--bd2)}
+.mc-row.checked{background:var(--aclo);border-color:var(--acbd);}
+.mc-row input[type=checkbox]{accent-color:var(--accent);width:13px;height:13px;cursor:pointer;flex-shrink:0;pointer-events:none;}
+.mc-badge{font-size:8.5px;padding:2px 6px;border-radius:4px;border:1px solid;flex-shrink:0;}
+.mc-badge.ds{background:#1e1440;border-color:#7c3aed;color:#c4b5fd;}
+.mc-badge.sc{background:#0d2b1e;border-color:#059669;color:#6ee7b7;}
+.mc-badge.cl{background:#271505;border-color:#b45309;color:#fcd34d;}
+.mc-label{font-size:10.5px;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.mc-meta{font-size:9px;color:var(--muted);white-space:nowrap;}
+
+/* Ensemble stepper */
+.ens-stepper{display:none;margin-top:10px;margin-bottom:4px;}
+.ens-stepper.on{display:block}
+.ens-step-hdr{font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:7px;display:flex;align-items:center;gap:6px;}
+.ens-step-hdr::after{content:'';flex:1;height:1px;background:var(--bd);}
+.ens-steps{display:flex;flex-direction:column;gap:4px;}
+.ens-step{padding:7px 10px;background:var(--surf);border:1px solid var(--bd2);border-radius:5px;transition:border-color .2s,background .2s;}
+.ens-step.active{background:var(--aclo);border-color:var(--acbd);}
+.ens-step.done{background:var(--greenlo);border-color:var(--greenbd);}
+.ens-step.fail{background:var(--redlo);border-color:var(--redbd);}
+.ens-step-top{display:grid;grid-template-columns:18px 1fr auto;align-items:center;gap:8px;font-size:10px;}
+.step-ico{font-size:11px;text-align:center;}
+.step-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text);}
+.step-status{font-size:9px;color:var(--muted);white-space:nowrap;}
+.ens-step-prog{display:none;height:3px;background:var(--bd2);border-radius:2px;margin-top:6px;overflow:hidden;}
+.ens-step-prog.on{display:block;}
+.ens-step-prog-bar{height:100%;background:var(--accent);border-radius:2px;transition:width .35s var(--ease);width:0%;}
+
+/* Metrics comparison table */
+.ref-metrics-section{display:none;margin-top:14px;}
+.ref-metrics-section.on{display:block;animation:fup .24s var(--ease) forwards}
+.ref-mtable{background:var(--surf);border:1px solid var(--bd);border-radius:var(--r);overflow:hidden;}
+.ref-mhdr{display:grid;grid-template-columns:1fr 46px 46px 46px 46px 56px;gap:4px;
+  padding:6px 10px;font-size:8.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;
+  border-bottom:1px solid var(--bd);background:var(--surf2);}
+.ref-mrow{display:grid;grid-template-columns:1fr 46px 46px 46px 46px 56px;gap:4px;
+  padding:7px 10px;font-size:10px;border-bottom:1px solid var(--bd2);align-items:center;transition:background .15s;}
+.ref-mrow:last-child{border-bottom:none}
+.ref-mrow.best-row{background:#0d1f10;}
+.ref-mrow.loading-row{opacity:.6;}
+.delta-pos{color:#4ade80;}.delta-neg{color:#f87171;}.delta-neu{color:#fbbf24;}.delta-dim{color:var(--muted)}
+.reward-cell{display:flex;align-items:center;gap:4px;}
+.tag.sm{font-size:8px;padding:1px 5px;}
+
+/* Diff viewer */
+.ref-diff-section{display:none;margin-top:12px;padding-bottom:24px;}
+.ref-diff-section.on{display:block;animation:fup .22s var(--ease) forwards}
+.ref-diff-wrap{background:var(--surf);border:1px solid var(--bd);border-radius:var(--r);overflow:hidden;}
+.ref-diff-hdr{padding:7px 10px;border-bottom:1px solid var(--bd);display:flex;align-items:center;gap:8px;background:var(--surf2);flex-wrap:wrap;row-gap:5px;}
+.diff-title{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;flex:1;min-width:80px;}
+.diff-model-btns{display:flex;gap:4px;flex-wrap:wrap;}
+.diff-mbtn{font-size:9px;padding:2px 7px;border-radius:4px;border:1px solid;cursor:pointer;opacity:.55;background:transparent;font-family:var(--mono);transition:opacity .14s;}
+.diff-mbtn.on{opacity:1;font-weight:700;}
+.diff-mbtn.ds{border-color:#7c3aed;color:#c4b5fd;}
+.diff-mbtn.sc{border-color:#059669;color:#6ee7b7;}
+.diff-mbtn.cl{border-color:#b45309;color:#fcd34d;}
+.diff-pre{margin:0;padding:10px;font-size:9.5px;line-height:1.6;overflow-x:auto;max-height:220px;white-space:pre;font-family:var(--mono);color:#c4c4e0;}
+.btn-save-ref{font-size:9.5px;padding:3px 9px;background:var(--surf);border:1px solid var(--bd);border-radius:4px;color:var(--text);cursor:pointer;white-space:nowrap;font-family:var(--mono);}
+.btn-save-ref:hover{background:var(--surf2);}
+
+::-webkit-scrollbar{width:3px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--bd2);border-radius:3px}
 @keyframes fdown{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:translateY(0)}}
 @keyframes fup{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:translateY(0)}}
 @keyframes spin{to{transform:rotate(360deg)}}
@@ -659,7 +687,6 @@ input[type=text]::placeholder{color:var(--muted2)}
   <div class="tagline">AI-powered test &amp; refactor</div>
 </div>
 
-<!-- Connection status bar -->
 <div class="conn-bar" id="conn-bar">
   <div class="conn-item">
     <span class="conn-dot chk" id="dot-api"></span>
@@ -680,20 +707,14 @@ input[type=text]::placeholder{color:var(--muted2)}
   <button class="otab"    onclick="oSwitch('refactor',this)">⟳ Refactor</button>
 </div>
 
-<!-- ══ Test Generation panel ══════════════════════════════════════ -->
+<!-- ══ Test Generation panel ════════════════════════════════════ -->
 <div class="mpanel on" id="mp-testgen">
-
-  <div class="fld backend-row">
-    <div class="lbl">Backend URL</div>
-    <input type="text" id="backendUrl" value="http://localhost:8000"/>
-  </div>
-
   <div class="inner-tabs-wrap">
     <button class="itab on" onclick="iSwitch('single',this)">Single File</button>
     <button class="itab"    onclick="iSwitch('zip',this)">Codebase</button>
   </div>
 
-  <!-- ── Single File ─────────────────────────────────────────────── -->
+  <!-- Single File -->
   <div class="spanel on" id="sp-single">
     <div class="fld">
       <div class="lbl">Python File <span class="lbl-badge" id="sf-auto-badge" style="display:none">auto</span></div>
@@ -710,70 +731,39 @@ input[type=text]::placeholder{color:var(--muted2)}
       <button class="btn btn-ghost" id="btn-browse-single" onclick="pickSingle()">Browse other file</button>
     </div>
     <button class="btn btn-violet" id="btn-single" onclick="genSingle()" disabled>⬡ Generate Tests</button>
-
-    <!-- Phase loader -->
-    <div class="loader" id="ld-single">
-      <div class="ring"></div>
-      <span class="loader-txt" id="ld-single-txt">Submitting…</span>
-    </div>
-
-    <!-- Progress -->
-    <div class="progress-wrap" id="single-prog-wrap" style="display:none">
-      <div class="progress-bar" id="single-prog-bar"></div>
-    </div>
+    <div class="loader" id="ld-single"><div class="ring"></div><span class="loader-txt" id="ld-single-txt">Submitting…</span></div>
+    <div class="progress-wrap" id="single-prog-wrap" style="display:none"><div class="progress-bar" id="single-prog-bar"></div></div>
     <div class="progress-label" id="single-prog-lbl" style="display:none"></div>
-
-    <!-- Status pill -->
     <div class="pill" id="pill-single"><span class="pdot"></span><span id="pill-single-txt"></span></div>
-
-    <!-- ── Algo results table ──────────────────────────────────── -->
     <div class="algo-section" id="algo-section">
       <div class="section-hdr">Pynguin Algorithm Results</div>
       <div class="algo-table">
         <div class="at-row hd">
-          <div class="at-cell">Algorithm</div>
-          <div class="at-cell">Tests</div>
-          <div class="at-cell right">Coverage</div>
-          <div class="at-cell right">Mutation</div>
-          <div class="at-cell right">Status</div>
+          <div class="at-cell">Algorithm</div><div class="at-cell">Tests</div>
+          <div class="at-cell right">Coverage</div><div class="at-cell right">Mutation</div><div class="at-cell right">Status</div>
         </div>
         <div id="algo-rows"></div>
       </div>
-      <!-- Download link shown after completion -->
       <div style="margin-top:6px;text-align:right">
         <a class="dl-link" id="single-dl" href="#" style="display:none">↓ Download All Tests</a>
       </div>
     </div>
-
-    <!-- ── Side-by-side code panels ───────────────────────────── -->
     <div class="code-section" id="code-section">
       <div class="section-hdr">Test Code</div>
       <div class="code-panels">
-        <!-- Raw best -->
         <div class="code-panel">
-          <div class="cp-hdr">
-            <span class="cp-title">Best Raw Output</span>
-            <span class="cp-badge raw" id="raw-algo-label">—</span>
-          </div>
-          <div class="cp-body">
-            <pre id="raw-code-pre"><span class="cp-empty">Run generation to see output</span></pre>
-          </div>
+          <div class="cp-hdr"><span class="cp-title">Best Raw Output</span><span class="cp-badge raw" id="raw-algo-label">—</span></div>
+          <div class="cp-body"><pre id="raw-code-pre"><span class="cp-empty">Run generation to see output</span></pre></div>
         </div>
-        <!-- Refined -->
         <div class="code-panel">
-          <div class="cp-hdr">
-            <span class="cp-title">DeepSeek Refined</span>
-            <span class="cp-badge refined">✦ refined</span>
-          </div>
-          <div class="cp-body">
-            <pre id="refined-code-pre"><span class="cp-empty">Refinement pending…</span></pre>
-          </div>
+          <div class="cp-hdr"><span class="cp-title">DeepSeek Refined</span><span class="cp-badge refined">✦ refined</span></div>
+          <div class="cp-body"><pre id="refined-code-pre"><span class="cp-empty">Refinement pending…</span></pre></div>
         </div>
       </div>
     </div>
   </div><!-- /sp-single -->
 
-  <!-- ── Codebase ZIP ────────────────────────────────────────────── -->
+  <!-- Codebase ZIP -->
   <div class="spanel" id="sp-zip">
     <div class="fld">
       <div class="lbl">ZIP Archive</div>
@@ -789,17 +779,14 @@ input[type=text]::placeholder{color:var(--muted2)}
     <div class="row mb">
       <button class="btn btn-ghost" id="btn-browse-zip" onclick="pickZip()">Browse ZIP</button>
     </div>
-
     <div class="lbl" style="margin-bottom:6px">Analysis Mode</div>
     <div class="mode-toggle">
       <button class="mtog single on" id="mtog-single" onclick="setMode('single')">⬡ Single Model</button>
       <button class="mtog ensemble"  id="mtog-ensemble" onclick="setMode('ensemble')">◈ Ensemble</button>
     </div>
     <div class="mode-desc" id="mode-desc">
-      <span class="hi">Single Model</span> — fast analysis using <span class="hi">deepseek-coder:1.3b</span>.
-      Good for most codebases.
+      <span class="hi">Single Model</span> — fast analysis using <span class="hi">deepseek-coder:1.3b</span>. Good for most codebases.
     </div>
-
     <button class="btn btn-violet" id="btn-zip" onclick="genZip()" disabled>⬡ Analyse Codebase</button>
     <div class="loader" id="ld-zip"><div class="ring" id="zip-ring"></div><span class="loader-txt" id="ld-zip-txt">Uploading…</span></div>
     <div class="progress-wrap" id="zip-prog-wrap" style="display:none"><div class="progress-bar" id="zip-prog-bar"></div></div>
@@ -816,99 +803,456 @@ input[type=text]::placeholder{color:var(--muted2)}
       </div>
     </div>
   </div><!-- /sp-zip -->
-
 </div><!-- /mp-testgen -->
 
-<!-- ══ Refactor panel ══════════════════════════════════════════════ -->
+<!-- ══ Refactor panel ════════════════════════════════════════════ -->
 <div class="mpanel" id="mp-refactor">
-  <div class="fld backend-row">
-    <div class="lbl">Backend URL</div>
-    <input type="text" id="refBackendUrl" value="http://localhost:8000"/>
-  </div>
-  <div class="divider"></div>
+
   <div class="lbl">Active File <span class="lbl-badge" id="ref-auto-badge">auto</span></div>
   <div class="ref-file-card mb">
-    <div class="ref-icon">🐍</div>
+    <div style="font-size:16px;flex-shrink:0;line-height:1;padding-top:1px">🐍</div>
     <div class="ref-body">
       <div class="ref-name empty" id="ref-name">Open a Python file in the editor</div>
       <div class="ref-sub" id="ref-sub"></div>
     </div>
     <button class="fc-dismiss" id="ref-dismiss" title="Clear file" onclick="clearRef()">×</button>
   </div>
-  <button class="btn btn-green" id="btn-refactor" onclick="doRefactor()" disabled>⟳ Refactor Code</button>
-  <div class="loader" id="ld-ref"><div class="ring green"></div><span class="loader-txt">Analysing &amp; refactoring…</span></div>
-  <div class="pill" id="pill-ref"><span class="pdot"></span><span id="pill-ref-txt"></span></div>
-  <div class="ref-result" id="ref-result">
-    <div class="rc-hdr"><span class="rc-title">Refactor Summary</span></div>
-    <div class="ref-summary" id="ref-summary"></div>
+
+  <!-- Model picker -->
+  <div class="model-pick-wrap">
+    <div class="model-pick-title">Select Model(s) — pick multiple for ensemble (runs sequentially)</div>
+    <div class="model-checks">
+      <div class="mc-row checked" id="mc-ds" onclick="toggleModel('deepseek-coder:1.3b',this)">
+        <input type="checkbox" id="chk-ds" checked>
+        <span class="mc-badge ds">DS</span>
+        <span class="mc-label">deepseek-coder:1.3b</span>
+        <span class="mc-meta">1.3B · fast</span>
+      </div>
+      <div class="mc-row" id="mc-sc" onclick="toggleModel('starcoder',this)">
+        <input type="checkbox" id="chk-sc">
+        <span class="mc-badge sc">SC</span>
+        <span class="mc-label">starcoder</span>
+        <span class="mc-meta">15.5B</span>
+      </div>
+      <div class="mc-row" id="mc-cl" onclick="toggleModel('codellama:7b',this)">
+        <input type="checkbox" id="chk-cl">
+        <span class="mc-badge cl">CL</span>
+        <span class="mc-label">codellama:7b</span>
+        <span class="mc-meta">7B · quality</span>
+      </div>
+    </div>
   </div>
-</div>
+
+  <button class="btn btn-violet" id="btn-refactor-run" onclick="runRefactor()" disabled>⟳ Run Refactor</button>
+
+  <!-- Loader + overall progress -->
+  <div class="loader" id="ld-ref"><div class="ring" id="ref-ring"></div><span class="loader-txt" id="ld-ref-txt">Initialising…</span></div>
+  <div class="progress-wrap" id="ref-prog-wrap" style="display:none;margin-top:10px;"><div class="progress-bar" id="ref-prog-bar"></div></div>
+  <div class="progress-label" id="ref-prog-lbl" style="display:none"></div>
+
+  <!-- Ensemble stepper -->
+  <div class="ens-stepper" id="ens-stepper">
+    <div class="ens-step-hdr">Ensemble Progress</div>
+    <div class="ens-steps" id="ens-steps"></div>
+  </div>
+
+  <div class="pill" id="pill-ref"><span class="pdot"></span><span id="pill-ref-txt"></span></div>
+
+  <!-- Metrics table (appears as each model finishes) -->
+  <div class="ref-metrics-section" id="ref-metrics-section">
+    <div class="section-hdr">Metrics</div>
+    <div class="ref-mtable">
+      <div class="ref-mhdr">
+        <span>Model</span><span>CC Δ</span><span>PEP8 Δ</span><span>HD Δ</span><span>LOC Δ</span><span>Reward</span>
+      </div>
+      <div id="ref-mrows"></div>
+    </div>
+  </div>
+
+  <!-- Diff viewer -->
+  <div class="ref-diff-section" id="ref-diff-section">
+    <div class="section-hdr">Diff</div>
+    <div class="ref-diff-wrap">
+      <div class="ref-diff-hdr">
+        <span class="diff-title" id="ref-diff-title">original → refactored</span>
+        <div class="diff-model-btns" id="ref-diff-btns"></div>
+        <button class="btn-save-ref" onclick="saveRefactorChoice()">💾 Save</button>
+      </div>
+      <pre class="diff-pre" id="ref-diff-pre"></pre>
+    </div>
+  </div>
+
+</div><!-- /mp-refactor -->
 
 <script>
 const vscode = acquireVsCodeApi();
+const BACKEND_URL = 'http://localhost:8000';
 
-/* ── State ───────────────────────────────────── */
+const MODELS = [
+  { id:'deepseek-coder:1.3b', chkId:'chk-ds', rowId:'mc-ds', cls:'ds' },
+  { id:'starcoder',           chkId:'chk-sc', rowId:'mc-sc', cls:'sc' },
+  { id:'codellama:7b',        chkId:'chk-cl', rowId:'mc-cl', cls:'cl' },
+];
+
+/* ── State ─────────────────────────────────── */
 let singleFilePath = '', singleDirPath = '';
-let zipFilePath    = '', refactorPath  = '';
+let zipFilePath = '', refactorPath = '';
 let zipAnalysisMode = 'single';
 const pollTimers = {};
-let connApiOk = false, connOllamaOk = false, checkDebounce = null;
+let connApiOk = false, connOllamaOk = false;
+
+// Refactor state
+let refRunning = false;
+let refResults = [];        // { model, status, reward, delta, diff, refactored_code, error }
+let refSelectedModel = null;
+let ensQueue = [];          // ordered list of model ids for this run
+let ensIndex = 0;           // which model in ensQueue we are currently running
+let refPollTimer = null;
 
 /* ── Connection bar ──────────────────────────── */
 function triggerCheck() {
-  const url = document.getElementById('backendUrl')?.value.trim() || 'http://localhost:8000';
   updateConnBar('chk','checking…','chk','checking…');
-  vscode.postMessage({ type:'checkBackend', backendUrl:url });
+  vscode.postMessage({ type:'checkBackend' });
 }
 function updateConnBar(as,at,os,ot) {
-  document.getElementById('dot-api').className    = 'conn-dot '+as;
-  document.getElementById('det-api').textContent  = at;
+  document.getElementById('dot-api').className = 'conn-dot '+as;
+  document.getElementById('det-api').textContent = at;
   document.getElementById('dot-ollama').className = 'conn-dot '+os;
   document.getElementById('det-ollama').textContent = ot;
 }
 
 /* ── Tab switching ───────────────────────────── */
-function oSwitch(id,btn){
+function oSwitch(id,btn) {
   document.querySelectorAll('.otab').forEach(t=>t.classList.remove('on'));
   document.querySelectorAll('.mpanel').forEach(p=>p.classList.remove('on'));
   btn.classList.add('on'); document.getElementById('mp-'+id).classList.add('on');
 }
-function iSwitch(id,btn){
+function iSwitch(id,btn) {
   document.querySelectorAll('.itab').forEach(t=>t.classList.remove('on'));
   document.querySelectorAll('.spanel').forEach(p=>p.classList.remove('on'));
   btn.classList.add('on'); document.getElementById('sp-'+id).classList.add('on');
 }
 
-/* ── Analysis mode toggle ────────────────────── */
-function setMode(mode){
+/* ── Analysis mode (test gen zip) ────────────── */
+function setMode(mode) {
   zipAnalysisMode = mode;
   document.getElementById('mtog-single').classList.toggle('on', mode==='single');
   document.getElementById('mtog-ensemble').classList.toggle('on', mode==='ensemble');
   const desc = document.getElementById('mode-desc');
-  const bar  = document.getElementById('zip-prog-bar');
-  const ring = document.getElementById('zip-ring');
-  if(mode==='single'){
+  if(mode==='single')
     desc.innerHTML='<span class="hi">Single Model</span> — fast analysis using <span class="hi">deepseek-coder:1.3b</span>. Good for most codebases.';
-    bar.classList.remove('amber'); ring.classList.remove('amber');
-  } else {
+  else
     desc.innerHTML='<span class="hi">Ensemble</span> — runs <span class="hi">deepseek-coder, starcoder &amp; codellama</span> in parallel, then merges the best tests. Slower but higher quality.';
-    bar.classList.add('amber'); ring.classList.add('amber');
+}
+
+/* ── Test gen polling ────────────────────────── */
+function startPolling(scope,jobId) {
+  stopPolling(scope);
+  pollTimers[scope] = setInterval(()=>vscode.postMessage({type:'pollJob',jobId,scope}),2000);
+}
+function stopPolling(scope) {
+  if(pollTimers[scope]){ clearInterval(pollTimers[scope]); delete pollTimers[scope]; }
+}
+
+/* ── Model picker ────────────────────────────── */
+function toggleModel(modelId, rowEl) {
+  const m = MODELS.find(x=>x.id===modelId);
+  if(!m) return;
+  const chk = document.getElementById(m.chkId);
+  chk.checked = !chk.checked;
+  rowEl.classList.toggle('checked', chk.checked);
+  updateRunBtn();
+}
+
+function selectedModels() {
+  return MODELS.filter(m=>document.getElementById(m.chkId).checked).map(m=>m.id);
+}
+
+function updateRunBtn() {
+  const sel = selectedModels();
+  const btn = document.getElementById('btn-refactor-run');
+  if(!sel.length || !refactorPath || refRunning){ btn.disabled=true; return; }
+  btn.disabled = false;
+  if(sel.length === 1) {
+    const short = sel[0].split(':')[0];
+    btn.className = 'btn btn-violet';
+    btn.textContent = '⟳ Refactor with '+short;
+  } else {
+    btn.className = 'btn btn-amber';
+    btn.textContent = '◈ Ensemble Refactor ('+sel.length+' models, sequential)';
   }
 }
 
-/* ── Polling ─────────────────────────────────── */
-function startPolling(scope,jobId,backendUrl){
-  stopPolling(scope);
-  pollTimers[scope]=setInterval(()=>vscode.postMessage({type:'pollJob',jobId,backendUrl,scope}),2000);
-}
-function stopPolling(scope){
-  if(pollTimers[scope]){clearInterval(pollTimers[scope]);delete pollTimers[scope];}
+/* ── Start refactor ──────────────────────────── */
+function runRefactor() {
+  if(!refactorPath){ showPill('ref','err','No Python file open'); return; }
+  if(!connApiOk){ showPill('ref','err','API offline — start the backend first'); return; }
+  const sel = selectedModels();
+  if(!sel.length){ showPill('ref','err','Select at least one model'); return; }
+
+  // Reset state
+  refRunning = true; refResults = []; refSelectedModel = null;
+  ensQueue = [...sel]; ensIndex = 0;
+
+  document.getElementById('btn-refactor-run').disabled = true;
+  document.getElementById('ref-dismiss').disabled = true;
+  document.getElementById('ref-metrics-section').classList.remove('on');
+  document.getElementById('ref-diff-section').classList.remove('on');
+  document.getElementById('ref-mrows').innerHTML = '';
+  document.getElementById('ref-diff-btns').innerHTML = '';
+  document.getElementById('ref-diff-pre').textContent = '';
+  hidePill('ref');
+
+  const isEnsemble = sel.length > 1;
+
+  if(isEnsemble) {
+    buildStepper(sel);
+    document.getElementById('ens-stepper').classList.add('on');
+    document.getElementById('ref-ring').className = 'ring amber';
+    setRefProgress(0, 'Preparing ensemble…');
+  } else {
+    document.getElementById('ens-stepper').classList.remove('on');
+    document.getElementById('ref-ring').className = 'ring';
+    setRefProgress(0, 'Starting…');
+  }
+  setLoader('ref', true, isEnsemble ? 'Ensemble: model 1 of '+sel.length+'…' : 'Submitting…');
+  kickNextModel();
 }
 
-/* ── Single file ─────────────────────────────── */
+/* ── Build ensemble stepper UI ───────────────── */
+function buildStepper(models) {
+  const wrap = document.getElementById('ens-steps');
+  wrap.innerHTML = '';
+  models.forEach((m,i) => {
+    const mc = MODELS.find(x=>x.id===m);
+    const div = document.createElement('div');
+    div.className = 'ens-step' + (i===0 ? ' active' : '');
+    div.id = 'ens-step-'+i;
+    div.innerHTML =
+      '<div class="ens-step-top">' +
+        '<span class="step-ico">'+(i===0?'⟳':'·')+'</span>' +
+        '<span class="step-name"><span class="mc-badge '+(mc?.cls||'')+'" style="margin-right:4px">'+(mc?.cls?.toUpperCase()||'')+'</span>'+esc(m)+'</span>' +
+        '<span class="step-status" id="step-st-'+i+'">'+(i===0?'running…':'queued')+'</span>' +
+      '</div>' +
+      '<div class="ens-step-prog'+(i===0?' on':'')+'" id="step-prog-'+i+'">' +
+        '<div class="ens-step-prog-bar" id="step-prog-bar-'+i+'"></div>' +
+      '</div>';
+    wrap.appendChild(div);
+  });
+}
+
+/* ── Fire the next model in queue ────────────── */
+function kickNextModel() {
+  if(ensIndex >= ensQueue.length){ finishAllRefactors(); return; }
+  vscode.postMessage({ type:'refactorSingleModel', filePath:refactorPath, model:ensQueue[ensIndex] });
+}
+
+/* ── Refactor-specific poll ──────────────────── */
+function startRefPoll(jobId) {
+  stopRefPoll();
+  refPollTimer = setInterval(()=>vscode.postMessage({type:'pollJob',jobId,scope:'refactor'}),2000);
+}
+function stopRefPoll() {
+  if(refPollTimer){ clearInterval(refPollTimer); refPollTimer=null; }
+}
+
+/* ── In-progress update for current model ────── */
+function onRefactorProgress(s) {
+  const pct = s.progress || 0;
+  const lbl = s.phase_label || 'Working…';
+  const total = ensQueue.length;
+  const base = Math.round((ensIndex/total)*100);
+  const slice = Math.round((1/total)*pct);
+  setRefProgress(base+slice, lbl+(total>1?' (model '+(ensIndex+1)+'/'+total+')':''));
+
+  // Update stepper bar
+  const barEl = document.getElementById('step-prog-bar-'+ensIndex);
+  if(barEl) barEl.style.width = pct+'%';
+
+  // Live preview of latest iteration metrics
+  if(s.iterations && s.iterations.length) {
+    const last = s.iterations[s.iterations.length-1];
+    upsertMetricRow(ensQueue[ensIndex], last.reward, last.delta, 'run');
+  }
+
+  setLoader('ref', true, lbl+(total>1?' — model '+(ensIndex+1)+'/'+total:''));
+}
+
+/* ── One model finished ──────────────────────── */
+function onRefactorModelDone(s) {
+  stopRefPoll();
+  const model = ensQueue[ensIndex];
+
+  if(s.status === 'error') {
+    refResults.push({ model, status:'error', error:s.error||'Error' });
+    upsertMetricRow(model, null, {}, 'err');
+    markStepFail(ensIndex, s.error||'error');
+  } else {
+    const iters = s.iterations || [];
+    const best = iters.length ? iters.reduce((a,b)=>b.reward>a.reward?b:a) : null;
+    const result = {
+      model,
+      status: 'ok',
+      reward: s.best_reward ?? best?.reward ?? null,
+      delta: best?.delta || {},
+      diff: s.final_diff || '',
+      refactored_code: s.best_code || '',
+    };
+    refResults.push(result);
+    upsertMetricRow(model, result.reward, result.delta, 'ok');
+    markStepDone(ensIndex);
+    if(result.refactored_code) addDiffBtn(model, result.diff, result.refactored_code);
+  }
+
+  ensIndex++;
+  const total = ensQueue.length;
+  setRefProgress(Math.round((ensIndex/total)*100), ensIndex+'/'+total+' model'+(total>1?'s':'')+' done');
+
+  if(ensIndex < total) {
+    // Mark next step active
+    const next = document.getElementById('ens-step-'+ensIndex);
+    if(next) {
+      next.classList.add('active');
+      const ico = next.querySelector('.step-ico'); if(ico) ico.textContent='⟳';
+      const st = document.getElementById('step-st-'+ensIndex); if(st) st.textContent='running…';
+      const prog = document.getElementById('step-prog-'+ensIndex); if(prog) prog.classList.add('on');
+    }
+    setLoader('ref', true, 'Ensemble: model '+(ensIndex+1)+' of '+total+'…');
+    kickNextModel();
+  } else {
+    finishAllRefactors();
+  }
+}
+
+/* ── All models done ─────────────────────────── */
+function finishAllRefactors() {
+  stopRefPoll();
+  refRunning = false;
+  setLoader('ref', false);
+  hideProgress('ref');
+  document.getElementById('ens-stepper').classList.remove('on');
+  document.getElementById('ref-dismiss').disabled = false;
+  updateRunBtn();
+
+  const ok = refResults.filter(r=>r.status==='ok').length;
+  const total = refResults.length;
+  if(!ok){ showPill('ref','err','All models failed'); return; }
+
+  showPill('ref','ok', ok+'/'+total+' model'+(total>1?'s':'')+' succeeded');
+  document.getElementById('ref-metrics-section').classList.add('on');
+  if(refResults.some(r=>r.diff)) document.getElementById('ref-diff-section').classList.add('on');
+
+  // Highlight best reward row
+  const withReward = refResults.filter(r=>r.reward!=null);
+  if(withReward.length) {
+    const best = withReward.reduce((a,b)=>b.reward>a.reward?b:a);
+    const el = document.getElementById('mrow-'+safeId(best.model));
+    if(el) el.classList.add('best-row');
+  }
+}
+
+/* ── Metric row upsert ───────────────────────── */
+function upsertMetricRow(model, reward, delta, state) {
+  const rowId = 'mrow-'+safeId(model);
+  let row = document.getElementById(rowId);
+  const mc = MODELS.find(x=>x.id===model);
+  const d = delta || {};
+
+  // For refactor metrics: lower CC/PEP8/HD/LOC is better, so negative delta = good (green)
+  const fmt = v => v==null ? '—' : (v>0?'+':'')+v.toFixed(1);
+  const dc = v => v==null?'delta-dim':v<0?'delta-pos':v>0?'delta-neg':'delta-neu';
+  const rw = reward!=null ? reward.toFixed(3) : '—';
+  const rwCls = reward==null?'delta-dim':reward>=0.3?'delta-pos':reward>=0?'delta-neu':'delta-neg';
+  const stateTag = state==='run'  ? '<span class="tag run sm">…</span>'
+                 : state==='ok'   ? '<span class="tag ok sm">ok</span>'
+                 : state==='err'  ? '<span class="tag err sm">err</span>' : '';
+
+  const html =
+    '<span class="mc-badge '+(mc?.cls||'')+' sm">'+esc(model)+'</span>'+
+    '<span class="'+dc(d.cyclomatic_delta)+'">'+fmt(d.cyclomatic_delta)+'</span>'+
+    '<span class="'+dc(d.pep8_delta)+'">'+fmt(d.pep8_delta)+'</span>'+
+    '<span class="'+dc(d.halstead_delta)+'">'+fmt(d.halstead_delta)+'</span>'+
+    '<span class="'+dc(d.loc_delta)+'">'+fmt(d.loc_delta)+'</span>'+
+    '<span class="reward-cell '+rwCls+'">'+rw+stateTag+'</span>';
+
+  document.getElementById('ref-metrics-section').classList.add('on');
+  if(!row) {
+    row = document.createElement('div');
+    row.className = 'ref-mrow'+(state==='run'?' loading-row':'');
+    row.id = rowId;
+    document.getElementById('ref-mrows').appendChild(row);
+  } else {
+    row.classList.toggle('loading-row', state==='run');
+  }
+  row.innerHTML = html;
+}
+
+/* ── Diff button ─────────────────────────────── */
+function addDiffBtn(model, diff, code) {
+  const mc = MODELS.find(x=>x.id===model);
+  if(document.getElementById('diffbtn-'+safeId(model))) return;
+  const b = document.createElement('button');
+  b.className = 'diff-mbtn '+(mc?.cls||'');
+  b.id = 'diffbtn-'+safeId(model);
+  b.textContent = model.split(':')[0];
+  b.onclick = () => {
+    document.querySelectorAll('.diff-mbtn').forEach(x=>x.classList.remove('on'));
+    b.classList.add('on');
+    refSelectedModel = model;
+    document.getElementById('ref-diff-pre').textContent = diff || '(no diff available)';
+    document.getElementById('ref-diff-title').textContent = 'original → '+model;
+  };
+  document.getElementById('ref-diff-btns').appendChild(b);
+  if(!refSelectedModel) {
+    b.classList.add('on');
+    refSelectedModel = model;
+    document.getElementById('ref-diff-pre').textContent = diff || '(no diff available)';
+    document.getElementById('ref-diff-title').textContent = 'original → '+model;
+    document.getElementById('ref-diff-section').classList.add('on');
+  }
+}
+
+/* ── Stepper helpers ─────────────────────────── */
+function markStepDone(i) {
+  const el = document.getElementById('ens-step-'+i); if(!el) return;
+  el.classList.remove('active'); el.classList.add('done');
+  const ico = el.querySelector('.step-ico'); if(ico) ico.textContent = '✓';
+  const st = document.getElementById('step-st-'+i); if(st) st.textContent = 'done';
+  const bar = document.getElementById('step-prog-bar-'+i); if(bar) bar.style.width='100%';
+}
+function markStepFail(i, msg) {
+  const el = document.getElementById('ens-step-'+i); if(!el) return;
+  el.classList.remove('active'); el.classList.add('fail');
+  const ico = el.querySelector('.step-ico'); if(ico) ico.textContent = '✗';
+  const st = document.getElementById('step-st-'+i); if(st){ st.textContent='failed'; st.title=msg||''; }
+}
+
+/* ── Save ────────────────────────────────────── */
+function saveRefactorChoice() {
+  if(!refSelectedModel){ showPill('ref','err','Select a model first'); return; }
+  const r = refResults.find(x=>x.model===refSelectedModel);
+  if(!r||!r.refactored_code){ showPill('ref','err','No code to save'); return; }
+  vscode.postMessage({ type:'saveRefactored', filePath:refactorPath, code:r.refactored_code, model:refSelectedModel });
+}
+
+function clearRef() {
+  refactorPath = '';
+  const n = document.getElementById('ref-name');
+  n.textContent = 'Open a Python file in the editor'; n.classList.add('empty');
+  document.getElementById('ref-sub').textContent = '';
+  document.getElementById('ref-dismiss').classList.remove('visible');
+  document.getElementById('ref-metrics-section').classList.remove('on');
+  document.getElementById('ref-diff-section').classList.remove('on');
+  document.getElementById('ens-stepper').classList.remove('on');
+  hideProgress('ref');
+  setLoader('ref',false);
+  hidePill('ref');
+  updateRunBtn();
+}
+
+/* ── Test gen file helpers ───────────────────── */
 function pickSingle(){ vscode.postMessage({type:'pickSingleFile',rootFolder:singleDirPath}); }
-
-function setSingleFile(fp,dir,name){
+function setSingleFile(fp,dir,name) {
   singleFilePath=fp; singleDirPath=dir||fp.replace(/[\\/][^\\/]+$/,'');
   const nameEl=document.getElementById('sf-name');
   nameEl.textContent=name||fp.split(/[\\/]/).pop(); nameEl.classList.remove('empty');
@@ -917,8 +1261,7 @@ function setSingleFile(fp,dir,name){
   document.getElementById('btn-single').disabled=false;
   document.getElementById('sf-dismiss').classList.add('visible');
 }
-
-function clearSingle(){
+function clearSingle() {
   singleFilePath=''; singleDirPath='';
   const n=document.getElementById('sf-name');
   n.textContent='Open a .py file or browse below'; n.classList.add('empty');
@@ -931,11 +1274,9 @@ function clearSingle(){
   document.getElementById('algo-section').classList.remove('on');
   document.getElementById('code-section').classList.remove('on');
 }
-
-function genSingle(){
+function genSingle() {
   if(!singleFilePath){ showPill('single','err','No file selected'); return; }
-  if(!checkReady('single')) return;
-  const backendUrl=document.getElementById('backendUrl').value.trim();
+  if(!connApiOk){ showPill('single','err','API offline — start the backend first'); return; }
   setLoader('single',true,'Submitting job…');
   setRunning('single',true); hidePill('single');
   document.getElementById('algo-section').classList.remove('on');
@@ -943,12 +1284,12 @@ function genSingle(){
   document.getElementById('btn-single').disabled=true;
   document.getElementById('single-prog-wrap').style.display='none';
   document.getElementById('single-prog-lbl').style.display='none';
-  vscode.postMessage({type:'generateSingle',filePath:singleFilePath,dirPath:singleDirPath,backendUrl});
+  vscode.postMessage({type:'generateSingle',filePath:singleFilePath,dirPath:singleDirPath});
 }
 
-/* ── ZIP ─────────────────────────────────────── */
+/* ── Test gen ZIP ────────────────────────────── */
 function pickZip(){ vscode.postMessage({type:'pickZipFile'}); }
-function clearZip(){
+function clearZip() {
   zipFilePath='';
   const n=document.getElementById('zip-name');
   n.textContent='No archive selected'; n.classList.add('empty');
@@ -959,27 +1300,47 @@ function clearZip(){
   hidePill('zip');
   document.getElementById('zr-main').classList.remove('on');
 }
-
-/* ── Refactor ────────────────────────────────── */
-function clearRef(){
-  refactorPath='';
-  const n=document.getElementById('ref-name');
-  n.textContent='Open a Python file in the editor'; n.classList.add('empty');
-  document.getElementById('ref-sub').textContent='';
-  document.getElementById('ref-dismiss').classList.remove('visible');
-  document.getElementById('btn-refactor').disabled=true;
-  hidePill('ref');
-  document.getElementById('ref-result').classList.remove('on');
+function genZip() {
+  if(!zipFilePath){ showPill('zip','err','No ZIP selected'); return; }
+  if(!connApiOk){ showPill('zip','err','API offline — start the backend first'); return; }
+  setLoader('zip',true,zipAnalysisMode==='ensemble'?'Uploading (ensemble)…':'Uploading ZIP…');
+  setRunning('zip',true); hidePill('zip');
+  document.getElementById('zr-main').classList.remove('on');
+  document.getElementById('btn-zip').disabled=true;
+  document.getElementById('zip-prog-wrap').style.display='none';
+  document.getElementById('zip-prog-lbl').style.display='none';
+  vscode.postMessage({type:'generateZip',zipPath:zipFilePath,analysisMode:zipAnalysisMode});
 }
 
-/* ── Pre-flight guard ────────────────────────── */
-function checkReady(scope){
-  if(!connApiOk){ showPill(scope,'err','API offline — start the backend first'); return false; }
-  if(!connOllamaOk){ showPill(scope,'info','Ollama offline — generation may fail'); }
-  return true;
+/* ── Shared UI helpers ───────────────────────── */
+function setLoader(scope,on,msg) {
+  const el=document.getElementById('ld-'+scope); if(!el) return;
+  el.classList.toggle('on',on);
+  if(msg){const t=el.querySelector('.loader-txt');if(t)t.textContent=msg;}
 }
-
-function setRunning(scope,running){
+function showPill(scope,type,msg) {
+  const el=document.getElementById('pill-'+scope); if(!el) return;
+  el.className='pill on '+type;
+  const t=document.getElementById('pill-'+scope+'-txt'); if(t) t.textContent=msg;
+}
+function hidePill(scope){ const el=document.getElementById('pill-'+scope); if(el) el.classList.remove('on'); }
+function showProgress(scope,pct,label) {
+  document.getElementById(scope+'-prog-wrap').style.display='block';
+  document.getElementById(scope+'-prog-lbl').style.display='block';
+  document.getElementById(scope+'-prog-bar').style.width=pct+'%';
+  document.getElementById(scope+'-prog-lbl').textContent=label;
+}
+function hideProgress(scope) {
+  const w=document.getElementById(scope+'-prog-wrap'); if(w) w.style.display='none';
+  const l=document.getElementById(scope+'-prog-lbl'); if(l) l.style.display='none';
+}
+function setRefProgress(pct,label) {
+  document.getElementById('ref-prog-wrap').style.display='block';
+  document.getElementById('ref-prog-lbl').style.display='block';
+  document.getElementById('ref-prog-bar').style.width=pct+'%';
+  document.getElementById('ref-prog-lbl').textContent=label;
+}
+function setRunning(scope,running) {
   if(scope==='single'){
     document.getElementById('btn-browse-single').disabled=running;
     document.getElementById('sf-dismiss').disabled=running;
@@ -988,202 +1349,103 @@ function setRunning(scope,running){
     document.getElementById('zip-dismiss').disabled=running;
     document.getElementById('mtog-single').disabled=running;
     document.getElementById('mtog-ensemble').disabled=running;
-  } else if(scope==='ref'){
-    document.getElementById('ref-dismiss').disabled=running;
   }
-}
-
-function genZip(){
-  if(!zipFilePath){ showPill('zip','err','No ZIP selected'); return; }
-  if(!checkReady('zip')) return;
-  const backendUrl=document.getElementById('backendUrl').value.trim();
-  setLoader('zip',true,zipAnalysisMode==='ensemble'?'Uploading (ensemble)…':'Uploading ZIP…');
-  setRunning('zip',true); hidePill('zip');
-  document.getElementById('zr-main').classList.remove('on');
-  document.getElementById('btn-zip').disabled=true;
-  document.getElementById('zip-prog-wrap').style.display='none';
-  document.getElementById('zip-prog-lbl').style.display='none';
-  vscode.postMessage({type:'generateZip',zipPath:zipFilePath,backendUrl,analysisMode:zipAnalysisMode});
-}
-
-function doRefactor(){
-  if(!refactorPath){ showPill('ref','err','No Python file open'); return; }
-  if(!checkReady('ref')) return;
-  const backendUrl=document.getElementById('refBackendUrl').value.trim();
-  setLoader('ref',true); setRunning('ref',true); hidePill('ref');
-  document.getElementById('ref-result').classList.remove('on');
-  document.getElementById('btn-refactor').disabled=true;
-  vscode.postMessage({type:'refactorCode',filePath:refactorPath,backendUrl});
-}
-
-/* ── Shared UI helpers ───────────────────────── */
-function setLoader(scope,on,msg){
-  const el=document.getElementById('ld-'+scope); el.classList.toggle('on',on);
-  if(msg) el.querySelector('.loader-txt').textContent=msg;
-}
-function showPill(scope,type,msg){
-  const el=document.getElementById('pill-'+scope);
-  el.className='pill on '+type;
-  document.getElementById('pill-'+scope+'-txt').textContent=msg;
-}
-function hidePill(scope){ document.getElementById('pill-'+scope).classList.remove('on'); }
-function showProgress(scope,pct,label){
-  document.getElementById(scope+'-prog-wrap').style.display='block';
-  document.getElementById(scope+'-prog-lbl').style.display='block';
-  document.getElementById(scope+'-prog-bar').style.width=pct+'%';
-  document.getElementById(scope+'-prog-lbl').textContent=label;
-}
-function hideProgress(scope){
-  document.getElementById(scope+'-prog-wrap').style.display='none';
-  document.getElementById(scope+'-prog-lbl').style.display='none';
 }
 function scoreClass(pct){ return pct>=70?'score-g':pct>=40?'score-a':'score-r'; }
 function esc(t){ const d=document.createElement('div');d.textContent=t;return d.innerHTML; }
+function safeId(s){ return s.replace(/[^a-zA-Z0-9]/g,'_'); }
 
-/* ── Render algo table rows ─────────────────── */
-function renderAlgoRows(results){
+/* ── Render algo table ───────────────────────── */
+function renderAlgoRows(results) {
   const container=document.getElementById('algo-rows');
   container.innerHTML='';
   results.forEach(r=>{
-    const cov = r.metrics?.coverage_percent ?? Math.round((r.coverage||0)*100);
-    const mut = r.metrics?.mutation_score   != null
-               ? Math.round(r.metrics.mutation_score*100)
-               : Math.round((r.mutation_score||0)*100);
-    const algo = (r.algorithm||'').toLowerCase();
-    const row=document.createElement('div');
-    row.className='at-row';
-    row.innerHTML=\`
-      <div class="at-cell">
-        <span class="algo-badge \${algo}">\${esc(r.algorithm||'—')}</span>
-      </div>
-      <div class="at-cell">\${r.num_tests!=null?r.num_tests+'  tests':'—'}</div>
-      <div class="at-cell right \${r.status==='success'?scoreClass(cov):'score-d'}">
-        \${r.status==='success'?cov+'%':'—'}
-      </div>
-      <div class="at-cell right \${r.status==='success'?scoreClass(mut):'score-d'}">
-        \${r.status==='success'?mut+'%':'—'}
-      </div>
-      <div class="at-cell right">
-        \${r.status==='success'
-          ? '<span class="tag ok">ok</span>'
-          : '<span class="tag err" title="'+esc(r.error||'')+'">error</span>'}
-      </div>\`;
+    const cov=r.metrics?.coverage_percent??Math.round((r.coverage||0)*100);
+    const mut=r.metrics?.mutation_score!=null?Math.round(r.metrics.mutation_score*100):Math.round((r.mutation_score||0)*100);
+    const algo=(r.algorithm||'').toLowerCase();
+    const row=document.createElement('div'); row.className='at-row';
+    row.innerHTML=
+      '<div class="at-cell"><span class="algo-badge '+algo+'">'+esc(r.algorithm||'—')+'</span></div>'+
+      '<div class="at-cell">'+(r.num_tests!=null?r.num_tests+' tests':'—')+'</div>'+
+      '<div class="at-cell right '+(r.status==='success'?scoreClass(cov):'score-d')+'">'+(r.status==='success'?cov+'%':'—')+'</div>'+
+      '<div class="at-cell right '+(r.status==='success'?scoreClass(mut):'score-d')+'">'+(r.status==='success'?mut+'%':'—')+'</div>'+
+      '<div class="at-cell right">'+(r.status==='success'?'<span class="tag ok">ok</span>':'<span class="tag err" title="'+esc(r.error||'')+'">error</span>')+'</div>';
     container.appendChild(row);
   });
 }
 
-/* ── Render code panels ─────────────────────── */
-function renderCodePanels(algoResults, refinement){
-  // Pick best raw algo by coverage
-  const successful = algoResults.filter(r=>r.status==='success' && r.content);
-  let best = successful.length
-    ? successful.reduce((a,b)=>(b.coverage||0)>(a.coverage||0)?b:a)
-    : null;
-
-  const rawPre = document.getElementById('raw-code-pre');
-  const rawLabel = document.getElementById('raw-algo-label');
-  if(best){
-    rawPre.textContent = best.content;
-    rawLabel.textContent = best.algorithm;
-  } else {
-    rawPre.innerHTML = '<span class="cp-empty">No successful output</span>';
-    rawLabel.textContent = '—';
-  }
-
-  const refinedPre = document.getElementById('refined-code-pre');
-  if(refinement && refinement.status==='success' && refinement.refined_code){
-    refinedPre.textContent = refinement.refined_code;
-  } else if(refinement && refinement.error){
-    refinedPre.innerHTML = '<span class="cp-empty">Refinement failed: '+esc(refinement.error)+'</span>';
-  } else {
-    refinedPre.innerHTML = '<span class="cp-empty">No refined output</span>';
-  }
+function renderCodePanels(algoResults,refinement) {
+  const successful=algoResults.filter(r=>r.status==='success'&&r.content);
+  const best=successful.length?successful.reduce((a,b)=>(b.coverage||0)>(a.coverage||0)?b:a):null;
+  const rawPre=document.getElementById('raw-code-pre');
+  const rawLabel=document.getElementById('raw-algo-label');
+  if(best){ rawPre.textContent=best.content; rawLabel.textContent=best.algorithm; }
+  else { rawPre.innerHTML='<span class="cp-empty">No successful output</span>'; rawLabel.textContent='—'; }
+  const refinedPre=document.getElementById('refined-code-pre');
+  if(refinement&&refinement.status==='success'&&refinement.refined_code) refinedPre.textContent=refinement.refined_code;
+  else if(refinement&&refinement.error) refinedPre.innerHTML='<span class="cp-empty">Refinement failed: '+esc(refinement.error)+'</span>';
+  else refinedPre.innerHTML='<span class="cp-empty">No refined output</span>';
 }
 
-/* ── Job completion ─────────────────────────── */
-function handleJobComplete(scope, jobData){
+function handleJobComplete(scope,jobData) {
   stopPolling(scope); setLoader(scope,false); hideProgress(scope); setRunning(scope,false);
-
   const btnMap={single:'btn-single',zip:'btn-zip'};
   if(btnMap[scope]) document.getElementById(btnMap[scope]).disabled=false;
-
-  if(jobData.status==='error'){
-    showPill(scope,'err',jobData.error||'Job failed'); return;
-  }
-
+  if(jobData.status==='error'){ showPill(scope,'err',jobData.error||'Job failed'); return; }
   if(scope==='single'){
-    const results  = jobData.results  || [];
-    const refinement = jobData.refinement || null;
-    const ok = results.filter(r=>r.status==='success').length;
-
-    showPill('single','ok',
-      \`\${ok}/\${results.length} algorithms succeeded\${refinement?.status==='success'?' · Refined ✓':''}\`);
-
-    // Table
+    const results=jobData.results||[];
+    const refinement=jobData.refinement||null;
+    const ok=results.filter(r=>r.status==='success').length;
+    showPill('single','ok',ok+'/'+results.length+' algorithms succeeded'+(refinement?.status==='success'?' · Refined ✓':''));
     renderAlgoRows(results);
     document.getElementById('algo-section').classList.add('on');
-
-    // Download link
-    if(jobData.download_url){
-      const dl=document.getElementById('single-dl');
-      dl.href=document.getElementById('backendUrl').value.trim()+jobData.download_url;
-      dl.style.display='';
-    }
-
-    // Code panels
-    renderCodePanels(results, refinement);
+    if(jobData.download_url){ const dl=document.getElementById('single-dl'); dl.href=BACKEND_URL+jobData.download_url; dl.style.display=''; }
+    renderCodePanels(results,refinement);
     document.getElementById('code-section').classList.add('on');
-
   } else if(scope==='zip'){
-    const results = jobData.results || [];
-    const ok = results.filter(r=>r.status==='success').length;
-    const mode = jobData.analysis_mode || zipAnalysisMode;
-    showPill('zip','ok',\`\${ok}/\${results.length} files analysed (\${mode})\`);
-    renderZipRows(results, document.getElementById('zr-rows'));
-    if(jobData.download_url){
-      const dl=document.getElementById('zr-dl');
-      dl.href=document.getElementById('backendUrl').value.trim()+jobData.download_url;
-      dl.style.display='';
-    }
+    const results=jobData.results||[];
+    const ok=results.filter(r=>r.status==='success').length;
+    const mode=jobData.analysis_mode||zipAnalysisMode;
+    showPill('zip','ok',ok+'/'+results.length+' files analysed ('+mode+')');
+    renderZipRows(results,document.getElementById('zr-rows'));
+    if(jobData.download_url){ const dl=document.getElementById('zr-dl'); dl.href=BACKEND_URL+jobData.download_url; dl.style.display=''; }
     document.getElementById('zr-main').classList.add('on');
   }
 }
 
-/* ── ZIP rows ───────────────────────────────── */
-function renderZipRows(results, container){
+function renderZipRows(results,container) {
   container.innerHTML='';
   results.forEach(r=>{
-    const cov = r.metrics?.coverage_percent ?? (r.coverage!=null?Math.round(r.coverage*100):null);
-    const mut = r.metrics?.mutation_score   != null ? Math.round(r.metrics.mutation_score*100)
-              : r.mutation_score            != null ? Math.round(r.mutation_score*100) : null;
-    const method = r.generation_method||'—'; const isEns = method==='ensemble';
+    const cov=r.metrics?.coverage_percent??(r.coverage!=null?Math.round(r.coverage*100):null);
+    const mut=r.metrics?.mutation_score!=null?Math.round(r.metrics.mutation_score*100):r.mutation_score!=null?Math.round(r.mutation_score*100):null;
+    const isEns=(r.generation_method||'')===('ensemble');
     const row=document.createElement('div'); row.className='zr-row';
-    row.innerHTML=\`
-      <div class="mt-file" title="\${esc(r.file)}">\${esc(r.file)}</div>
-      <div class="mt-val \${cov!=null?scoreClass(cov):''}">\${cov!=null?cov+'%':'—'}</div>
-      <div class="mt-val \${mut!=null?scoreClass(mut):''}">\${mut!=null?mut+'%':'—'}</div>
-      <div class="mt-val"><span class="tag \${isEns?'ens':'ok'}">\${isEns?'ensemble':'single'}</span></div>
-      <div class="mt-val"><span class="tag \${r.status==='success'?'ok':'err'}">\${r.status}</span></div>\`;
+    row.innerHTML=
+      '<div class="mt-file" title="'+esc(r.file)+'">'+esc(r.file)+'</div>'+
+      '<div class="mt-val '+(cov!=null?scoreClass(cov):'')+'">'+(cov!=null?cov+'%':'—')+'</div>'+
+      '<div class="mt-val '+(mut!=null?scoreClass(mut):'')+'">'+(mut!=null?mut+'%':'—')+'</div>'+
+      '<div class="mt-val"><span class="tag '+(isEns?'ens':'ok')+'">'+(isEns?'ensemble':'single')+'</span></div>'+
+      '<div class="mt-val"><span class="tag '+(r.status==='success'?'ok':'err')+'">'+r.status+'</span></div>';
     container.appendChild(row);
   });
 }
 
-/* ── Message handler ────────────────────────── */
+/* ── Message handler ──────────────────────────── */
 window.addEventListener('message', ev=>{
-  const m=ev.data;
+  const m = ev.data;
   switch(m.type){
 
-    case 'activeFileChanged':{
+    case 'activeFileChanged': {
       const fp=m.filePath||'', name=fp.split(/[\\/]/).pop(), dir=fp.replace(/[\\/][^\\/]+$/,'');
       document.getElementById('sf-auto-badge').style.display='';
       setSingleFile(fp,dir,name);
-      refactorPath=fp;
+      refactorPath = fp;
       const rn=document.getElementById('ref-name');
       rn.textContent=fp||'No Python file open'; rn.classList.toggle('empty',!fp);
       document.getElementById('ref-sub').textContent=fp?dir:'';
-      document.getElementById('btn-refactor').disabled=!fp;
       const rd=document.getElementById('ref-dismiss');
       if(fp) rd.classList.add('visible'); else rd.classList.remove('visible');
+      updateRunBtn();
       break;
     }
 
@@ -1192,7 +1454,7 @@ window.addEventListener('message', ev=>{
       setSingleFile(m.filePath,m.dirPath,m.fileName);
       break;
 
-    case 'zipFilePicked':{
+    case 'zipFilePicked': {
       zipFilePath=m.zipPath;
       const zn=document.getElementById('zip-name');
       zn.textContent=m.zipName; zn.classList.remove('empty');
@@ -1205,29 +1467,33 @@ window.addEventListener('message', ev=>{
 
     case 'generationStarted': break;
 
-    case 'jobStarted':{
+    case 'jobStarted': {
       const scope=m.scope;
       setLoader(scope,true,'Running pipeline…');
       showProgress(scope,0,'Starting…');
-      startPolling(scope,m.jobId,m.backendUrl);
+      startPolling(scope,m.jobId);
       break;
     }
 
-    case 'jobStatus':{
+    case 'jobStatus': {
       const scope=m.scope, s=m.status;
+
+      // Refactor polling
+      if(scope==='refactor'){
+        if(s.status==='queued'||s.status==='processing') onRefactorProgress(s);
+        else onRefactorModelDone(s);
+        break;
+      }
+
+      // Test gen polling
       if(s.status==='queued'||s.status==='processing'){
         const pct=s.progress||0;
-        const phaseLabel = s.phase_label || (s.phase==='pynguin'?'Running Pynguin algorithms…'
-                                           : s.phase==='refining'?'Refining with DeepSeek…'
-                                           : 'Running pipeline…');
+        const phaseLabel=s.phase_label||(s.phase==='pynguin'?'Running Pynguin algorithms…':s.phase==='refining'?'Refining with DeepSeek…':'Running pipeline…');
         const file=s.current_file?' — '+s.current_file:'';
         setLoader(scope,true,phaseLabel);
         showProgress(scope,pct,pct+'%'+file);
-
-        // Show partial algo table while pynguin is running
-        if(scope==='single' && s.algo_results && s.algo_results.length){
-          renderAlgoRows(s.algo_results);
-          document.getElementById('algo-section').classList.add('on');
+        if(scope==='single'&&s.algo_results&&s.algo_results.length){
+          renderAlgoRows(s.algo_results); document.getElementById('algo-section').classList.add('on');
         }
       } else {
         handleJobComplete(scope,s);
@@ -1235,7 +1501,7 @@ window.addEventListener('message', ev=>{
       break;
     }
 
-    case 'generationError':{
+    case 'generationError': {
       const sc=m.scope||'single';
       stopPolling(sc); setLoader(sc,false); hideProgress(sc); setRunning(sc,false);
       const btnId=sc==='single'?'btn-single':sc==='zip'?'btn-zip':null;
@@ -1244,33 +1510,34 @@ window.addEventListener('message', ev=>{
       break;
     }
 
-    case 'refactorStarted': break;
-    case 'refactorComplete':
-      setLoader('ref',false); setRunning('ref',false);
-      document.getElementById('btn-refactor').disabled=false;
-      showPill('ref','ok','Refactoring complete');
-      if(m.result?.summary){
-        document.getElementById('ref-summary').textContent=m.result.summary;
-        document.getElementById('ref-result').classList.add('on');
-      }
+    // Backend accepted the refactor job — start polling it
+    case 'refactorJobStarted':
+      startRefPoll(m.jobId);
       break;
-    case 'refactorError':
-      setLoader('ref',false); setRunning('ref',false);
-      document.getElementById('btn-refactor').disabled=false;
-      showPill('ref','err',m.error||'Error'); break;
+
+    // Backend rejected the refactor job submission
+    case 'refactorJobError': {
+      stopRefPoll();
+      const model = m.model || ensQueue[ensIndex] || '?';
+      markStepFail(ensIndex, m.error);
+      refResults.push({ model, status:'error', error:m.error });
+      upsertMetricRow(model, null, {}, 'err');
+      ensIndex++;
+      if(ensIndex < ensQueue.length) kickNextModel();
+      else finishAllRefactors();
+      break;
+    }
 
     case 'backendStatus':
       connApiOk=m.apiOk; connOllamaOk=m.ollamaOk;
-      updateConnBar(m.apiOk?'ok':'err', m.apiDetail||(m.apiOk?'connected':'offline'),
-                   m.ollamaOk?'ok':'err', m.ollamaDetail||(m.ollamaOk?'ready':'offline'));
+      updateConnBar(
+        m.apiOk?'ok':'err', m.apiDetail||(m.apiOk?'connected':'offline'),
+        m.ollamaOk?'ok':'err', m.ollamaDetail||(m.ollamaOk?'ready':'offline')
+      );
+      updateRunBtn();
       break;
   }
 });
-
-/* ── Debounced re-check on URL change ────────── */
-function scheduleCheck(){ clearTimeout(checkDebounce); checkDebounce=setTimeout(triggerCheck,800); }
-document.getElementById('backendUrl').addEventListener('input',scheduleCheck);
-document.getElementById('refBackendUrl').addEventListener('input',scheduleCheck);
 
 vscode.postMessage({type:'requestActiveFile'});
 triggerCheck();

@@ -12,12 +12,27 @@ import uuid
 import shutil
 import time
 import threading
+import difflib
+import io
 from pathlib import Path
 import requests
 import traceback
 import sys
 import re
 from typing import Dict, Any, List, Tuple, Optional, Set
+
+try:
+    import pycodestyle
+    _PYCODESTYLE_OK = True
+except ImportError:
+    _PYCODESTYLE_OK = False
+
+try:
+    from radon.complexity import cc_visit
+    from radon.metrics import h_visit
+    _RADON_OK = True
+except ImportError:
+    _RADON_OK = False
 from dataclasses import dataclass, field
 from enum import Enum
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -46,7 +61,13 @@ for d in (UPLOAD_FOLDER, EXTRACT_FOLDER, TESTS_FOLDER):
 jobs: dict = {}
 
 # ── Pynguin algorithms used for single-file generation ────────────────────────
-PYNGUIN_ALGORITHMS = ["RANDOM", "WHOLE_SUITE", "DYNAMOSA"]
+PYNGUIN_ALGORITHMS   = ["RANDOM", "WHOLE_SUITE", "DYNAMOSA"]
+
+# ── Refactoring constants ──────────────────────────────────────────────────────
+REFACTOR_MODELS      = ["deepseek-coder:1.3b", "starcoder", "codellama:7b"]
+PPO_MAX_ITERATIONS   = 5
+PPO_REWARD_THRESHOLD = 0.6
+REWARD_WEIGHTS       = {"cyclomatic": 0.35, "pep8": 0.30, "halstead": 0.20, "loc": 0.15}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1609,6 +1630,366 @@ def process_zip_job(job_id, zip_path, extract_path, model, ollama_url, timeout, 
         print(traceback.format_exc())
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Code Quality Metrics  (used by refactor pipelines)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _pep8_count(code: str) -> int:
+    if not _PYCODESTYLE_OK:
+        return 0
+    try:
+        import tempfile as _tmp
+        with _tmp.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            f.write(code); fname = f.name
+        result = subprocess.run(
+            [sys.executable, "-m", "pycodestyle", "--statistics", "-q", fname],
+            capture_output=True, text=True, timeout=10)
+        os.unlink(fname)
+        total = 0
+        for line in result.stdout.strip().splitlines():
+            parts = line.split()
+            if parts and parts[0].isdigit():
+                total += int(parts[0])
+        return total
+    except Exception:
+        return 0
+
+
+def _cyclomatic_complexity_score(code: str) -> float:
+    if _RADON_OK:
+        try:
+            results = cc_visit(code)
+            if results:
+                return round(sum(r.complexity for r in results) / len(results), 2)
+            return 1.0
+        except Exception:
+            pass
+    kw = ["if ", "elif ", "for ", "while ", "except ", "and ", "or "]
+    count = sum(code.count(k) for k in kw)
+    lines = [l for l in code.splitlines() if l.strip()]
+    return round(1 + count / max(len(lines), 1) * 10, 2)
+
+
+def _halstead_difficulty_score(code: str) -> float:
+    if _RADON_OK:
+        try:
+            result = h_visit(code)
+            if result:
+                return round(result[0].difficulty, 2)
+        except Exception:
+            pass
+    try:
+        tree = ast.parse(code)
+        operators, operands = 0, 0
+        uo: Set[str] = set(); ud: Set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod,
+                                  ast.And, ast.Or, ast.Not, ast.Eq, ast.NotEq,
+                                  ast.Lt, ast.LtE, ast.Gt, ast.GtE,
+                                  ast.Is, ast.IsNot, ast.In, ast.NotIn)):
+                operators += 1; uo.add(type(node).__name__)
+            if isinstance(node, ast.Name):
+                operands += 1; ud.add(node.id)
+            elif isinstance(node, ast.Constant):
+                operands += 1
+        if ud:
+            return round((len(uo) / 2.0) * (operands / len(ud)), 2)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _loc_score(code: str) -> int:
+    return sum(1 for l in code.splitlines()
+               if l.strip() and not l.strip().startswith("#"))
+
+
+def compute_code_metrics(code: str) -> dict:
+    return {
+        "loc":        _loc_score(code),
+        "cyclomatic": _cyclomatic_complexity_score(code),
+        "halstead":   _halstead_difficulty_score(code),
+        "pep8":       _pep8_count(code),
+    }
+
+
+def metrics_delta(before: dict, after: dict) -> dict:
+    """Positive delta = improvement (reduction in a bad metric)."""
+    return {
+        "loc_delta":        before["loc"]        - after["loc"],
+        "cyclomatic_delta": before["cyclomatic"] - after["cyclomatic"],
+        "halstead_delta":   before["halstead"]   - after["halstead"],
+        "pep8_delta":       before["pep8"]       - after["pep8"],
+    }
+
+
+def unified_diff_str(original: str, refactored: str, filename: str = "code.py") -> str:
+    orig = original.splitlines(keepends=True)
+    new  = refactored.splitlines(keepends=True)
+    return "".join(difflib.unified_diff(
+        orig, new,
+        fromfile=f"original/{filename}",
+        tofile=f"refactored/{filename}",
+        lineterm="",
+    ))
+
+
+def compute_reward(before: dict, after: dict) -> float:
+    """Reward in [-1, 1]. Positive = better code."""
+    total = 0.0
+    for key, weight in REWARD_WEIGHTS.items():
+        bv = before[key]; av = after[key]
+        if bv == 0:
+            comp = 0.0 if av == 0 else -1.0
+        else:
+            ratio = bv / max(av, 0.01)
+            comp  = max(-1.0, min(1.0, ratio - 1.0))
+        total += weight * comp
+    return round(total, 4)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ★  Multi-model refactor pipeline
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _refactor_one_model(
+    code: str, module_name: str, model: str,
+    ollama_url: str, timeout: int, before: dict,
+) -> dict:
+    result = {
+        "model": model, "status": "pending",
+        "refactored_code": None, "summary": None,
+        "before": before, "after": None, "delta": None,
+        "reward": None, "diff": None, "error": None, "elapsed": 0.0,
+    }
+    t0 = time.time()
+    try:
+        refactored, summary = refactor_code_ollama(
+            code=code, module_name=module_name,
+            ollama_url=ollama_url, model=model, timeout=timeout,
+        )
+        elapsed = round(time.time() - t0, 2)
+        after   = compute_code_metrics(refactored)
+        result.update({
+            "status":          "success",
+            "refactored_code": refactored,
+            "summary":         summary,
+            "after":           after,
+            "delta":           metrics_delta(before, after),
+            "reward":          compute_reward(before, after),
+            "diff":            unified_diff_str(code, refactored, f"{module_name}.py"),
+            "elapsed":         elapsed,
+        })
+    except Exception as e:
+        result["status"]  = "error"
+        result["error"]   = str(e)
+        result["elapsed"] = round(time.time() - t0, 2)
+    return result
+
+
+def process_multimodel_refactor(
+    job_id: str, code: str, module_name: str,
+    ollama_url: str, timeout: int,
+):
+    jobs[job_id].update({
+        "status": "processing", "progress": 0,
+        "phase": "running", "phase_label": "Running 3 models in parallel…",
+    })
+    before = compute_code_metrics(code)
+    jobs[job_id]["before_metrics"] = before
+    model_results: List[dict] = []
+
+    def _run(m):
+        return _refactor_one_model(code, module_name, m, ollama_url, timeout, before)
+
+    try:
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            futures = {ex.submit(_run, m): m for m in REFACTOR_MODELS}
+            done = 0
+            for f in as_completed(futures):
+                model_results.append(f.result())
+                done += 1
+                jobs[job_id]["progress"] = int(done / 3 * 100)
+                jobs[job_id]["partial_results"] = model_results[:]
+
+        model_results.sort(key=lambda r: r.get("reward") or -99, reverse=True)
+        best = model_results[0]["model"] if model_results else None
+        jobs[job_id].update({
+            "status":       "completed", "progress": 100,
+            "phase":        "done",      "phase_label": "Complete",
+            "results":      model_results,
+            "best_model":   best,
+            "message":      f"3 models complete. Best: {best}",
+        })
+    except Exception as e:
+        jobs[job_id]["status"] = "error"
+        jobs[job_id]["error"]  = str(e)
+        print(traceback.format_exc())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ★  Simulated-PPO refactor pipeline
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _ppo_feedback_prompt(
+    original: str, current: str, module_name: str,
+    iteration: int, reward: float, delta: dict,
+    ollama_url: str, model: str, timeout: int,
+) -> Tuple[str, str]:
+    fb = []
+    if delta["cyclomatic_delta"] <= 0:
+        fb.append("- Cyclomatic complexity DID NOT improve. Simplify branches and nested conditionals.")
+    else:
+        fb.append(f"- Cyclomatic complexity improved by {delta['cyclomatic_delta']:.2f}. Preserve this.")
+    if delta["pep8_delta"] <= 0:
+        fb.append("- PEP8 violations DID NOT improve. Fix spacing, naming, and line length.")
+    else:
+        fb.append(f"- PEP8 violations reduced by {delta['pep8_delta']}. Preserve this.")
+    if delta["halstead_delta"] <= 0:
+        fb.append("- Halstead difficulty DID NOT improve. Reduce operator and operand variety.")
+    else:
+        fb.append(f"- Halstead difficulty improved by {delta['halstead_delta']:.2f}. Preserve this.")
+    if delta["loc_delta"] < 0:
+        fb.append("- Lines of code INCREASED. Remove verbosity and dead code.")
+    elif delta["loc_delta"] > 0:
+        fb.append(f"- Lines of code reduced by {delta['loc_delta']}. Good.")
+
+    reward_pct = int((reward + 1) / 2 * 100)
+    prompt = f"""You are an AI code quality optimizer — iteration {iteration} of a feedback-driven loop.
+Current reward score: {reward_pct}/100 (higher = better).
+
+Feedback on previous refactoring:
+{chr(10).join(fb)}
+
+Refactor the module again, specifically addressing areas that did NOT improve.
+Do not regress on areas that did improve.
+
+Original module ({module_name}):
+```python
+{original}
+```
+
+Previous version (iteration {iteration - 1}):
+```python
+{current}
+```
+
+Respond with exactly:
+
+REFACTORED_CODE:
+```python
+<complete improved module>
+```
+
+SUMMARY:
+<brief bullet list of changes in this iteration>"""
+
+    try:
+        raw = call_ollama(prompt, ollama_url, model, timeout)
+        return _parse_refactor_response(raw, current)
+    except Exception as e:
+        return current, f"Iteration {iteration} failed: {e}"
+
+
+def process_ppo_refactor(
+    job_id: str, code: str, module_name: str,
+    ollama_url: str, model: str, timeout: int,
+    max_iterations: int = PPO_MAX_ITERATIONS,
+):
+    jobs[job_id].update({
+        "status": "processing", "progress": 0,
+        "phase": "ppo", "phase_label": "Initialising PPO loop…",
+        "iterations": [],
+    })
+    before      = compute_code_metrics(code)
+    current     = code
+    best_code   = code
+    best_reward = -99.0
+    log: List[dict] = []
+    jobs[job_id]["before_metrics"] = before
+
+    # initialise so loop body can reference these on iteration 2+
+    reward = 0.0
+    delta  = {k: 0 for k in ("cyclomatic_delta", "pep8_delta", "halstead_delta", "loc_delta")}
+
+    try:
+        for i in range(1, max_iterations + 1):
+            jobs[job_id]["phase_label"] = f"PPO iteration {i}/{max_iterations}…"
+            jobs[job_id]["progress"]    = int((i - 1) / max_iterations * 90)
+
+            if i == 1:
+                try:
+                    refactored, summary = refactor_code_ollama(
+                        code=current, module_name=module_name,
+                        ollama_url=ollama_url, model=model, timeout=timeout,
+                    )
+                except Exception as e:
+                    refactored, summary = current, f"Initial refactor failed: {e}"
+            else:
+                refactored, summary = _ppo_feedback_prompt(
+                    code, current, module_name, i,
+                    reward, delta, ollama_url, model, timeout,
+                )
+
+            after  = compute_code_metrics(refactored)
+            delta  = metrics_delta(before, after)
+            reward = compute_reward(before, after)
+            diff   = unified_diff_str(current, refactored, f"{module_name}.py")
+
+            entry = {
+                "iteration": i,
+                "reward":    reward,
+                "after":     after,
+                "delta":     delta,
+                "summary":   summary,
+                "diff":      diff,
+                "code":      refactored,
+            }
+            log.append(entry)
+            jobs[job_id]["iterations"] = log[:]
+            jobs[job_id]["progress"]   = int(i / max_iterations * 90)
+
+            if reward > best_reward:
+                best_reward = reward
+                best_code   = refactored
+            current = refactored
+
+            if reward >= PPO_REWARD_THRESHOLD:
+                jobs[job_id]["phase_label"] = (
+                    f"Early stop at iteration {i} "
+                    f"(reward {reward:.2f} ≥ {PPO_REWARD_THRESHOLD})"
+                )
+                break
+
+        fa    = compute_code_metrics(best_code)
+        fd    = metrics_delta(before, fa)
+        fr    = compute_reward(before, fa)
+        fdiff = unified_diff_str(code, best_code, f"{module_name}.py")
+
+        jobs[job_id].update({
+            "status":           "completed",
+            "progress":         100,
+            "phase":            "done",
+            "phase_label":      "PPO complete",
+            "best_code":        best_code,
+            "best_reward":      best_reward,
+            "final_after":      fa,
+            "final_delta":      fd,
+            "final_reward":     fr,
+            "final_diff":       fdiff,
+            "total_iterations": len(log),
+            "message": (
+                f"PPO complete — {len(log)} iteration(s), "
+                f"best reward {best_reward:.3f}"
+            ),
+        })
+    except Exception as e:
+        jobs[job_id]["status"] = "error"
+        jobs[job_id]["error"]  = str(e)
+        print(traceback.format_exc())
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Routes
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1645,6 +2026,44 @@ async def generate_tests_multiple_endpoint(req: MultipleFileRequest):
         daemon=True,
     ).start()
     return {"message": "Job submitted", "job_id": job_id, "scope": "multiple"}
+
+
+
+@app.post("/refactor-multimodel")
+async def refactor_multimodel_endpoint(req: RefactorRequest):
+    """Refactor using deepseek-coder, starcoder, and codellama in parallel.
+    Returns per-model metrics (cyclomatic, PEP8, Halstead, LOC delta) + diffs."""
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {
+        "status": "queued", "submitted_at": time.time(),
+        "filename": f"{req.module_name}.py", "scope": "multimodel_refactor",
+    }
+    threading.Thread(
+        target=process_multimodel_refactor,
+        args=(job_id, req.code, req.module_name, req.ollama_url, req.ollama_timeout),
+        daemon=True,
+    ).start()
+    return {"job_id": job_id, "scope": "multimodel_refactor"}
+
+
+@app.post("/refactor-ppo")
+async def refactor_ppo_endpoint(req: RefactorRequest):
+    """Simulated-PPO iterative refactor: score output → feed back → re-generate.
+    Runs up to 5 iterations; stops early when reward >= 0.6."""
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {
+        "status": "queued", "submitted_at": time.time(),
+        "filename": f"{req.module_name}.py", "scope": "ppo_refactor",
+    }
+    threading.Thread(
+        target=process_ppo_refactor,
+        args=(
+            job_id, req.code, req.module_name,
+            req.ollama_url, req.ollama_model, req.ollama_timeout,
+        ),
+        daemon=True,
+    ).start()
+    return {"job_id": job_id, "scope": "ppo_refactor"}
 
 
 @app.post("/refactor", response_model=RefactorResponse)
@@ -1768,7 +2187,7 @@ async def update_config(new_config: dict):
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "service": "Codexter", "version": "2.2.0"}
+    return {"status": "healthy", "service": "Codexter", "version": "2.3.0"}
 
 
 @app.get("/ollama-status")
