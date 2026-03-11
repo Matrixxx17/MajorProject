@@ -72,9 +72,6 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
         case "pickSingleFile":
           await this.pickSingleFile(msg.rootFolder);
           break;
-        case "pickMultipleFiles":
-          await this.pickMultipleFiles();
-          break;
         case "pickZipFile":
           await this.pickZipFile();
           break;
@@ -85,10 +82,6 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
             msg.dirPath,
             msg.backendUrl,
           );
-          break;
-
-        case "generateMultiple":
-          await this.handleMultipleGeneration(msg.filePaths, msg.backendUrl);
           break;
 
         // analysisMode is now forwarded from the webview ("single" | "ensemble")
@@ -102,6 +95,10 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
 
         case "pollJob":
           await this.pollJob(msg.jobId, msg.backendUrl, msg.scope);
+          break;
+
+        case "checkBackend":
+          await this.checkBackend(msg.backendUrl);
           break;
 
         case "refactorCode":
@@ -132,23 +129,6 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
         filePath: uris[0].fsPath,
         dirPath: path.dirname(uris[0].fsPath),
         fileName: path.basename(uris[0].fsPath),
-      });
-    }
-  }
-
-  private async pickMultipleFiles() {
-    const uris = await vscode.window.showOpenDialog({
-      canSelectFiles: true,
-      canSelectFolders: false,
-      canSelectMany: true,
-      filters: { "Python Files": ["py"] },
-      openLabel: "Select Python Files",
-    });
-    if (uris?.length) {
-      this._view?.webview.postMessage({
-        type: "multipleFilesPicked",
-        filePaths: uris.map((u) => u.fsPath),
-        fileNames: uris.map((u) => path.basename(u.fsPath)),
       });
     }
   }
@@ -210,52 +190,6 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
       this._view?.webview.postMessage({
         type: "generationError",
         scope: "single",
-        error: this.extractError(err, backendUrl),
-      });
-    }
-  }
-
-  private async handleMultipleGeneration(
-    filePaths: string[],
-    backendUrl: string,
-  ) {
-    this._view?.webview.postMessage({
-      type: "generationStarted",
-      scope: "multiple",
-    });
-
-    try {
-      const files = await Promise.all(
-        filePaths.map(async (fp) => {
-          const code = Buffer.from(
-            await vscode.workspace.fs.readFile(vscode.Uri.file(fp)),
-          ).toString("utf8");
-          return {
-            code,
-            module_name: path.basename(fp, ".py"),
-            directory: path.dirname(fp),
-            file_path: fp,
-          };
-        }),
-      );
-
-      const { data } = await axios.post(
-        `${backendUrl}/generate-tests-multiple`,
-        { files },
-        { timeout: 30000 },
-      );
-
-      this._view?.webview.postMessage({
-        type: "jobStarted",
-        scope: "multiple",
-        jobId: data.job_id,
-        backendUrl,
-        totalFiles: filePaths.length,
-      });
-    } catch (err) {
-      this._view?.webview.postMessage({
-        type: "generationError",
-        scope: "multiple",
         error: this.extractError(err, backendUrl),
       });
     }
@@ -346,6 +280,71 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
         status: { status: "error", error: "Could not reach backend" },
       });
     }
+  }
+
+  /**
+   * Pre-flight connectivity check.
+   * Hits /health (FastAPI) then /ollama-status (Ollama via FastAPI).
+   * Posts a single `backendStatus` message back with both results.
+   */
+  private async checkBackend(backendUrl: string) {
+    // ── 1. Check FastAPI ─────────────────────────────────────────
+    let apiOk = false;
+    let apiDetail = "";
+    try {
+      const { data } = await axios.get(`${backendUrl}/health`, {
+        timeout: 4000,
+      });
+      apiOk = data?.status === "healthy";
+      apiDetail = apiOk ? `v${data?.version ?? "?"}` : "unexpected response";
+    } catch (err) {
+      if (axios.isAxiosError(err)) {
+        apiDetail =
+          err.code === "ECONNREFUSED"
+            ? "not running"
+            : (err.message ?? "unreachable");
+      } else {
+        apiDetail = "unreachable";
+      }
+    }
+
+    // ── 2. Check Ollama (only if FastAPI is up) ──────────────────
+    let ollamaOk = false;
+    let ollamaDetail = "";
+    let ollamaModels: string[] = [];
+    if (apiOk) {
+      try {
+        const { data } = await axios.get(`${backendUrl}/ollama-status`, {
+          timeout: 6000,
+        });
+        ollamaOk = data?.status === "connected";
+        if (ollamaOk) {
+          ollamaModels = data?.models ?? [];
+          const hasDeepseek = ollamaModels.some((m: string) =>
+            m.startsWith("deepseek-coder"),
+          );
+          ollamaDetail = hasDeepseek
+            ? `${ollamaModels.length} model${ollamaModels.length !== 1 ? "s" : ""} — deepseek-coder ✓`
+            : `${ollamaModels.length} model${ollamaModels.length !== 1 ? "s" : ""} — deepseek-coder missing`;
+          if (!hasDeepseek) ollamaOk = false; // treat missing model as not-ready
+        } else {
+          ollamaDetail = data?.error ?? "not running";
+        }
+      } catch (err) {
+        ollamaDetail = "not running";
+      }
+    } else {
+      ollamaDetail = "api offline";
+    }
+
+    this._view?.webview.postMessage({
+      type: "backendStatus",
+      apiOk,
+      apiDetail,
+      ollamaOk,
+      ollamaDetail,
+      ollamaModels,
+    });
   }
 
   private async handleRefactoring(filePath: string, backendUrl: string) {
@@ -515,6 +514,36 @@ html,body{
   letter-spacing:.09em;text-transform:uppercase;
 }
 
+/* ─── Connection status bar ───────────────────────── */
+.conn-bar{
+  display:flex;align-items:center;gap:6px;
+  margin:10px 15px 0;padding:7px 10px;
+  background:var(--surf);border:1px solid var(--bd);
+  border-radius:var(--r);
+  opacity:0;animation:fdown .38s var(--ease) .16s forwards;
+}
+.conn-item{
+  display:flex;align-items:center;gap:5px;
+  font-size:9.5px;color:var(--muted);
+  flex:1;min-width:0;
+}
+.conn-sep{width:1px;height:12px;background:var(--bd2);flex-shrink:0}
+.conn-dot{
+  width:6px;height:6px;border-radius:50%;flex-shrink:0;
+  background:var(--muted2);transition:background .25s,box-shadow .25s;
+}
+.conn-dot.ok  {background:var(--green); box-shadow:0 0 6px rgba(62,207,110,.5)}
+.conn-dot.err {background:var(--red);   box-shadow:0 0 6px rgba(240,112,112,.4)}
+.conn-dot.chk {background:var(--amber); animation:pulse .9s ease-in-out infinite}
+.conn-lbl{letter-spacing:.06em;text-transform:uppercase;font-size:8.5px}
+.conn-detail{font-size:8.5px;color:var(--muted2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+.conn-recheck{
+  margin-left:auto;padding:2px 6px;border:1px solid var(--bd2);border-radius:4px;
+  background:transparent;color:var(--muted);font-family:var(--mono);font-size:8.5px;
+  cursor:pointer;transition:color .14s,border-color .14s;flex-shrink:0;
+}
+.conn-recheck:hover{color:var(--text);border-color:var(--accent)}
+
 /* ─── Outer tabs ──────────────────────────────────────────── */
 .outer-tabs{
   display:flex;gap:2px;margin:14px 15px 0;
@@ -596,6 +625,17 @@ input[type=text]::placeholder{color:var(--muted2)}
 .fc-name{font-size:11px;color:var(--text);word-break:break-all;line-height:1.4}
 .fc-name.empty{color:var(--muted);font-style:italic}
 .fc-sub{font-size:9.5px;color:var(--muted);margin-top:3px;word-break:break-all}
+
+/* ─── Dismiss (×) button on file cards ───────────────── */
+.fc-dismiss{
+  display:none;flex-shrink:0;align-self:center;
+  width:18px;height:18px;border-radius:4px;border:none;
+  background:transparent;color:var(--muted);font-size:13px;line-height:1;
+  cursor:pointer;padding:0;transition:background .14s,color .14s;
+}
+.fc-dismiss:hover{background:var(--redlo);color:var(--red)}
+.fc-dismiss.visible{display:flex;align-items:center;justify-content:center}
+.fc-dismiss:disabled{opacity:.25;cursor:not-allowed;pointer-events:none}
 
 /* ─── File list ───────────────────────────────────────────── */
 .file-list{
@@ -759,6 +799,22 @@ input[type=text]::placeholder{color:var(--muted2)}
   <div class="tagline">AI-powered test &amp; refactor</div>
 </div>
 
+<!-- ── Connection status bar ─────────────────────────────────── -->
+<div class="conn-bar" id="conn-bar">
+  <div class="conn-item">
+    <span class="conn-dot chk" id="dot-api"></span>
+    <span class="conn-lbl">API</span>
+    <span class="conn-detail" id="det-api">checking…</span>
+  </div>
+  <div class="conn-sep"></div>
+  <div class="conn-item">
+    <span class="conn-dot chk" id="dot-ollama"></span>
+    <span class="conn-lbl">Ollama</span>
+    <span class="conn-detail" id="det-ollama">checking…</span>
+  </div>
+  <button class="conn-recheck" onclick="triggerCheck()" title="Re-check connections">↺</button>
+</div>
+
 <div class="outer-tabs">
   <button class="otab on" onclick="oSwitch('testgen',this)">⬡ Test Gen</button>
   <button class="otab"    onclick="oSwitch('refactor',this)">⟳ Refactor</button>
@@ -774,7 +830,6 @@ input[type=text]::placeholder{color:var(--muted2)}
 
   <div class="inner-tabs-wrap">
     <button class="itab on" onclick="iSwitch('single',this)">Single File</button>
-    <button class="itab"    onclick="iSwitch('multi',this)">Multiple Files</button>
     <button class="itab"    onclick="iSwitch('zip',this)">Codebase</button>
   </div>
 
@@ -788,10 +843,11 @@ input[type=text]::placeholder{color:var(--muted2)}
           <div class="fc-name empty" id="sf-name">Open a .py file or browse below</div>
           <div class="fc-sub" id="sf-dir"></div>
         </div>
+        <button class="fc-dismiss" id="sf-dismiss" title="Clear file" onclick="clearSingle()">×</button>
       </div>
     </div>
     <div class="row mb">
-      <button class="btn btn-ghost" onclick="pickSingle()">Browse other file</button>
+      <button class="btn btn-ghost" id="btn-browse-single" onclick="pickSingle()">Browse other file</button>
     </div>
     <button class="btn btn-violet" id="btn-single" onclick="genSingle()" disabled>⬡ Generate Tests</button>
     <div class="loader" id="ld-single"><div class="ring"></div><span class="loader-txt" id="ld-single-txt">Submitting…</span></div>
@@ -808,27 +864,6 @@ input[type=text]::placeholder{color:var(--muted2)}
     </div>
   </div>
 
-  <!-- Multiple Files -->
-  <div class="spanel" id="sp-multi">
-    <div class="fld">
-      <div class="lbl">Selected Files <span class="lbl-badge green" id="multi-count-badge" style="display:none"></span></div>
-      <div class="file-list" id="multi-file-list"></div>
-    </div>
-    <div class="row mb">
-      <button class="btn btn-ghost" onclick="pickMulti()">Add / change files</button>
-    </div>
-    <button class="btn btn-violet" id="btn-multi" onclick="genMulti()" disabled>⬡ Generate Tests for All</button>
-    <div class="loader" id="ld-multi"><div class="ring"></div><span class="loader-txt" id="ld-multi-txt">Submitting…</span></div>
-    <div class="progress-wrap" id="multi-prog-wrap" style="display:none"><div class="progress-bar" id="multi-prog-bar"></div></div>
-    <div class="progress-label" id="multi-prog-lbl" style="display:none"></div>
-    <div class="pill" id="pill-multi"><span class="pdot"></span><span id="pill-multi-txt"></span></div>
-    <div class="multi-table" id="mt-table">
-      <div class="mt-hdr"><span class="mt-hdr-txt">File Results</span></div>
-      <div class="mt-row hd"><div>File</div><div class="mt-val">Cov</div><div class="mt-val">Mut</div><div class="mt-val">Status</div></div>
-      <div id="mt-rows"></div>
-    </div>
-  </div>
-
   <!-- Codebase ZIP -->
   <div class="spanel" id="sp-zip">
     <div class="fld">
@@ -839,10 +874,11 @@ input[type=text]::placeholder{color:var(--muted2)}
           <div class="fc-name empty" id="zip-name">No archive selected</div>
           <div class="fc-sub" id="zip-sub"></div>
         </div>
+        <button class="fc-dismiss" id="zip-dismiss" title="Clear archive" onclick="clearZip()">×</button>
       </div>
     </div>
     <div class="row mb">
-      <button class="btn btn-ghost" onclick="pickZip()">Browse ZIP</button>
+      <button class="btn btn-ghost" id="btn-browse-zip" onclick="pickZip()">Browse ZIP</button>
     </div>
 
     <!-- ── Analysis mode toggle (new) ─────────────────────────────── -->
@@ -894,6 +930,7 @@ input[type=text]::placeholder{color:var(--muted2)}
       <div class="ref-name empty" id="ref-name">Open a Python file in the editor</div>
       <div class="ref-sub" id="ref-sub"></div>
     </div>
+    <button class="fc-dismiss" id="ref-dismiss" title="Clear file" onclick="clearRef()">×</button>
   </div>
   <button class="btn btn-green" id="btn-refactor" onclick="doRefactor()" disabled>⟳ Refactor Code</button>
   <div class="loader" id="ld-ref"><div class="ring green"></div><span class="loader-txt">Analysing &amp; refactoring…</span></div>
@@ -910,12 +947,36 @@ const vscode = acquireVsCodeApi();
 /* ── State ─────────────────────────────────────────── */
 let singleFilePath = '';
 let singleDirPath  = '';
-let multiFilePaths = [];
 let zipFilePath    = '';
 let refactorPath   = '';
 let zipAnalysisMode = 'single';   // 'single' | 'ensemble'
 
 const pollTimers = {};
+
+/* ── Connection state ──────────────────────────────── */
+let connApiOk     = false;
+let connOllamaOk  = false;
+let checkDebounce = null;
+
+function triggerCheck() {
+  const url = document.getElementById('backendUrl')?.value.trim()
+           || document.getElementById('refBackendUrl')?.value.trim()
+           || 'http://localhost:8000';
+  updateConnBar('chk', 'checking…', 'chk', 'checking…');
+  vscode.postMessage({ type: 'checkBackend', backendUrl: url });
+}
+
+function updateConnBar(apiState, apiTxt, ollamaState, ollamaTxt) {
+  const dotApi    = document.getElementById('dot-api');
+  const detApi    = document.getElementById('det-api');
+  const dotOllama = document.getElementById('dot-ollama');
+  const detOllama = document.getElementById('det-ollama');
+
+  dotApi.className    = 'conn-dot ' + apiState;
+  detApi.textContent  = apiTxt;
+  dotOllama.className = 'conn-dot ' + ollamaState;
+  detOllama.textContent = ollamaTxt;
+}
 
 /* ── Tab switching ─────────────────────────────────── */
 function oSwitch(id, btn) {
@@ -977,11 +1038,28 @@ function setSingleFile(fp, dir, name) {
   dirEl.textContent = singleDirPath;
   document.getElementById('sf-card').classList.add('active');
   document.getElementById('btn-single').disabled = false;
+  document.getElementById('sf-dismiss').classList.add('visible');
+}
+function clearSingle() {
+  singleFilePath = '';
+  singleDirPath  = '';
+  const nameEl = document.getElementById('sf-name');
+  nameEl.textContent = 'Open a .py file or browse below';
+  nameEl.classList.add('empty');
+  document.getElementById('sf-dir').textContent = '';
+  document.getElementById('sf-card').classList.remove('active');
+  document.getElementById('sf-dismiss').classList.remove('visible');
+  document.getElementById('sf-auto-badge').style.display = 'none';
+  document.getElementById('btn-single').disabled = true;
+  hidePill('single');
+  document.getElementById('rc-single').classList.remove('on');
 }
 function genSingle() {
   if (!singleFilePath) { showPill('single','err','No file selected'); return; }
+  if (!checkReady('single')) return;
   const backendUrl = document.getElementById('backendUrl').value.trim();
   setLoader('single', true, 'Submitting job…');
+  setRunning('single', true);
   hidePill('single');
   document.getElementById('rc-single').classList.remove('on');
   document.getElementById('btn-single').disabled = true;
@@ -990,51 +1068,71 @@ function genSingle() {
   vscode.postMessage({ type:'generateSingle', filePath:singleFilePath, dirPath:singleDirPath, backendUrl });
 }
 
-/* ── Multiple files ────────────────────────────────── */
-function pickMulti() {
-  vscode.postMessage({ type: 'pickMultipleFiles' });
-}
-function setMultiFiles(paths, names) {
-  multiFilePaths = paths;
-  const list = document.getElementById('multi-file-list');
-  list.innerHTML = '';
-  paths.forEach((fp, i) => {
-    const dir = fp.replace(/[\\/][^\\/]+$/, '');
-    const li = document.createElement('div');
-    li.className = 'fli';
-    li.innerHTML = \`<span style="font-size:10px">🐍</span>
-      <div style="flex:1;min-width:0">
-        <div class="fli-name">\${esc(names[i])}</div>
-        <div class="fli-dir">\${esc(dir)}</div>
-      </div>\`;
-    list.appendChild(li);
-  });
-  const badge = document.getElementById('multi-count-badge');
-  badge.textContent = paths.length + ' file' + (paths.length !== 1 ? 's' : '');
-  badge.style.display = '';
-  document.getElementById('btn-multi').disabled = paths.length === 0;
-}
-function genMulti() {
-  if (!multiFilePaths.length) { showPill('multi','err','No files selected'); return; }
-  const backendUrl = document.getElementById('backendUrl').value.trim();
-  setLoader('multi', true, 'Submitting job…');
-  hidePill('multi');
-  document.getElementById('mt-table').classList.remove('on');
-  document.getElementById('btn-multi').disabled = true;
-  document.getElementById('multi-prog-wrap').style.display = 'none';
-  document.getElementById('multi-prog-lbl').style.display  = 'none';
-  vscode.postMessage({ type:'generateMultiple', filePaths:multiFilePaths, backendUrl });
-}
-
 /* ── ZIP ───────────────────────────────────────────── */
 function pickZip() {
   vscode.postMessage({ type: 'pickZipFile' });
 }
+function clearZip() {
+  zipFilePath = '';
+  const nameEl = document.getElementById('zip-name');
+  nameEl.textContent = 'No archive selected';
+  nameEl.classList.add('empty');
+  document.getElementById('zip-sub').textContent = '';
+  document.getElementById('zip-card').classList.remove('active');
+  document.getElementById('zip-dismiss').classList.remove('visible');
+  document.getElementById('btn-zip').disabled = true;
+  hidePill('zip');
+  document.getElementById('zr-main').classList.remove('on');
+}
+
+/* ── Refactor clear ─────────────────────────────────── */
+function clearRef() {
+  refactorPath = '';
+  const rn = document.getElementById('ref-name');
+  rn.textContent = 'Open a Python file in the editor';
+  rn.classList.add('empty');
+  document.getElementById('ref-sub').textContent = '';
+  document.getElementById('ref-dismiss').classList.remove('visible');
+  document.getElementById('btn-refactor').disabled = true;
+  hidePill('ref');
+  document.getElementById('ref-result').classList.remove('on');
+}
+
+/**
+ * Pre-flight guard. Returns true if safe to proceed.
+ * Blocks if FastAPI is offline; warns (but allows) if Ollama is offline.
+ */
+function checkReady(uiScope) {
+  if (!connApiOk) {
+    showPill(uiScope, 'err', 'API offline — start the backend first');
+    return false;
+  }
+  if (!connOllamaOk) {
+    // surface a warning pill but don't block — backend will handle gracefully
+    showPill(uiScope, 'info', 'Ollama offline — generation may fail');
+  }
+  return true;
+}
+function setRunning(scope, running) {
+  if (scope === 'single') {
+    document.getElementById('btn-browse-single').disabled = running;
+    document.getElementById('sf-dismiss').disabled        = running;
+  } else if (scope === 'zip') {
+    document.getElementById('btn-browse-zip').disabled    = running;
+    document.getElementById('zip-dismiss').disabled       = running;
+    document.getElementById('mtog-single').disabled       = running;
+    document.getElementById('mtog-ensemble').disabled     = running;
+  } else if (scope === 'ref') {
+    document.getElementById('ref-dismiss').disabled       = running;
+  }
+}
 function genZip() {
   if (!zipFilePath) { showPill('zip','err','No ZIP selected'); return; }
+  if (!checkReady('zip')) return;
   const backendUrl = document.getElementById('backendUrl').value.trim();
   const modeLabel  = zipAnalysisMode === 'ensemble' ? 'Uploading (ensemble)…' : 'Uploading ZIP…';
   setLoader('zip', true, modeLabel);
+  setRunning('zip', true);
   hidePill('zip');
   document.getElementById('zr-main').classList.remove('on');
   document.getElementById('btn-zip').disabled = true;
@@ -1047,8 +1145,10 @@ function genZip() {
 /* ── Refactor ──────────────────────────────────────── */
 function doRefactor() {
   if (!refactorPath) { showPill('ref','err','No Python file open'); return; }
+  if (!checkReady('ref')) return;
   const backendUrl = document.getElementById('refBackendUrl').value.trim();
   setLoader('ref', true);
+  setRunning('ref', true);
   hidePill('ref');
   document.getElementById('ref-result').classList.remove('on');
   document.getElementById('btn-refactor').disabled = true;
@@ -1083,24 +1183,6 @@ function scoreClass(pct) { return pct >= 70 ? 'g' : pct >= 40 ? 'a' : 'r'; }
 function esc(t) { const d=document.createElement('div'); d.textContent=t; return d.innerHTML; }
 function ts()   { return new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}); }
 
-/* ── Render rows for multi panel ───────────────────── */
-function renderMultiRows(results, container) {
-  container.innerHTML = '';
-  results.forEach(r => {
-    const cov = r.metrics?.coverage_percent ?? (r.coverage != null ? Math.round(r.coverage*100) : null);
-    const mut = r.metrics?.mutation_score   != null ? Math.round(r.metrics.mutation_score*100)
-              : r.mutation_score            != null ? Math.round(r.mutation_score*100) : null;
-    const row = document.createElement('div');
-    row.className = 'mt-row';
-    row.innerHTML = \`
-      <div class="mt-file" title="\${esc(r.file)}">\${esc(r.file)}</div>
-      <div class="mt-val \${cov!=null?scoreClass(cov):''}">\${cov!=null?cov+'%':'—'}</div>
-      <div class="mt-val \${mut!=null?scoreClass(mut):''}">\${mut!=null?mut+'%':'—'}</div>
-      <div class="mt-val"><span class="tag \${r.status==='success'?'ok':'err'}">\${r.status}</span></div>\`;
-    container.appendChild(row);
-  });
-}
-
 /* ── Render rows for ZIP panel (has extra Method column) */
 function renderZipRows(results, container) {
   container.innerHTML = '';
@@ -1128,11 +1210,14 @@ function handleJobComplete(scope, jobData) {
   setLoader(scope, false);
   hideProgress(scope);
 
-  const btnMap = { single:'btn-single', multiple:'btn-multi', zip:'btn-zip' };
-  document.getElementById(btnMap[scope]).disabled = false;
+  setRunning(scope, false);
+
+  const btnMap = { single:'btn-single', zip:'btn-zip' };
+  document.getElementById(btnMap[scope])?.disabled === false;
+  if (btnMap[scope]) document.getElementById(btnMap[scope]).disabled = false;
 
   if (jobData.status === 'error') {
-    showPill(scope === 'multiple' ? 'multi' : scope, 'err', jobData.error || 'Job failed');
+    showPill(scope, 'err', jobData.error || 'Job failed');
     return;
   }
 
@@ -1155,12 +1240,6 @@ function handleJobComplete(scope, jobData) {
     document.getElementById('rc-code').innerHTML = esc(r.content || '');
     document.getElementById('rc-single-time').textContent = ts();
     document.getElementById('rc-single').classList.add('on');
-
-  } else if (scope === 'multiple') {
-    const ok = results.filter(r => r.status==='success').length;
-    showPill('multi', ok===results.length?'ok':'info', \`\${ok}/\${results.length} files generated\`);
-    renderMultiRows(results, document.getElementById('mt-rows'));
-    document.getElementById('mt-table').classList.add('on');
 
   } else if (scope === 'zip') {
     const ok    = results.filter(r => r.status==='success').length;
@@ -1196,16 +1275,15 @@ window.addEventListener('message', ev => {
       rn.classList.toggle('empty', !fp);
       document.getElementById('ref-sub').textContent = fp ? dir : '';
       document.getElementById('btn-refactor').disabled = !fp;
+      const refDismiss = document.getElementById('ref-dismiss');
+      if (fp) refDismiss.classList.add('visible');
+      else    refDismiss.classList.remove('visible');
       break;
     }
 
     case 'singleFilePicked':
       document.getElementById('sf-auto-badge').style.display = 'none';
       setSingleFile(m.filePath, m.dirPath, m.fileName);
-      break;
-
-    case 'multipleFilesPicked':
-      setMultiFiles(m.filePaths, m.fileNames);
       break;
 
     case 'zipFilePicked': {
@@ -1215,6 +1293,7 @@ window.addEventListener('message', ev => {
       zn.classList.remove('empty');
       document.getElementById('zip-sub').textContent = m.zipPath;
       document.getElementById('zip-card').classList.add('active');
+      document.getElementById('zip-dismiss').classList.add('visible');
       document.getElementById('btn-zip').disabled = false;
       break;
     }
@@ -1223,14 +1302,8 @@ window.addEventListener('message', ev => {
       break;
 
     case 'jobStarted': {
-      const scope   = m.scope;
-      const uiScope = scope === 'multiple' ? 'multi' : scope;
-
-      setLoader(uiScope, true, 'Running pipeline…');
-
-      if (scope === 'multiple' && m.totalFiles) {
-        showProgress('multi', 0, \`0/\${m.totalFiles} queued\`);
-      }
+      const scope = m.scope;
+      setLoader(scope, true, 'Running pipeline…');
       if (scope === 'single') {
         showProgress('single', 0, 'Processing…');
       }
@@ -1239,32 +1312,22 @@ window.addEventListener('message', ev => {
         setLoader('zip', true, modeLabel);
         showProgress('zip', 0, 'Processing…');
       }
-
       startPolling(scope, m.jobId, m.backendUrl);
       break;
     }
 
     case 'jobStatus': {
-      const scope   = m.scope;
-      const uiScope = scope === 'multiple' ? 'multi' : scope;
-      const s       = m.status;
-
+      const scope = m.scope;
+      const s     = m.status;
       if (s.status === 'queued' || s.status === 'processing') {
         const pct  = s.progress || 0;
         const file = s.current_file ? \` — \${s.current_file}\` : '';
         const lbl  = \`\${pct}%\${file}\`;
-
         const runningTxt = (scope === 'zip' && zipAnalysisMode === 'ensemble')
           ? 'Running ensemble pipeline…'
           : 'Running pipeline…';
-        setLoader(uiScope, true, s.status === 'queued' ? 'Queued…' : runningTxt);
-        showProgress(uiScope, pct, lbl);
-
-        if (scope === 'multiple' && s.total_files) {
-          const done = s.results?.length || 0;
-          document.getElementById('ld-multi-txt').textContent =
-            \`Processing \${done}/\${s.total_files}…\`;
-        }
+        setLoader(scope, true, s.status === 'queued' ? 'Queued…' : runningTxt);
+        showProgress(scope, pct, lbl);
       } else {
         handleJobComplete(scope, s);
       }
@@ -1292,18 +1355,20 @@ window.addEventListener('message', ev => {
 
     case 'generationError': {
       const sc = m.scope || 'single';
-      const ui = sc === 'multiple' ? 'multi' : sc;
       stopPolling(sc);
-      setLoader(ui, false);
-      hideProgress(ui);
-      document.getElementById('btn-' + (ui === 'multi' ? 'multi' : ui)).disabled = false;
-      showPill(ui, 'err', m.error || 'Error');
+      setLoader(sc, false);
+      hideProgress(sc);
+      setRunning(sc, false);
+      const btnId = sc === 'single' ? 'btn-single' : sc === 'zip' ? 'btn-zip' : null;
+      if (btnId) document.getElementById(btnId).disabled = false;
+      showPill(sc, 'err', m.error || 'Error');
       break;
     }
 
     case 'refactorStarted': break;
     case 'refactorComplete': {
       setLoader('ref', false);
+      setRunning('ref', false);
       document.getElementById('btn-refactor').disabled = false;
       showPill('ref','ok','Refactoring complete');
       if (m.result?.summary) {
@@ -1314,13 +1379,33 @@ window.addEventListener('message', ev => {
     }
     case 'refactorError':
       setLoader('ref', false);
+      setRunning('ref', false);
       document.getElementById('btn-refactor').disabled = false;
       showPill('ref','err', m.error || 'Error');
       break;
+    case 'backendStatus': {
+      connApiOk    = m.apiOk;
+      connOllamaOk = m.ollamaOk;
+      const apiState    = m.apiOk    ? 'ok'  : 'err';
+      const ollamaState = m.ollamaOk ? 'ok'  : 'err';
+      updateConnBar(apiState, m.apiDetail || (m.apiOk ? 'connected' : 'offline'),
+                    ollamaState, m.ollamaDetail || (m.ollamaOk ? 'ready' : 'offline'));
+      break;
+    }
   }
 });
 
+/* ── Debounced re-check on URL input change ────────── */
+function scheduleCheck() {
+  clearTimeout(checkDebounce);
+  checkDebounce = setTimeout(triggerCheck, 800);
+}
+document.getElementById('backendUrl').addEventListener('input', scheduleCheck);
+document.getElementById('refBackendUrl').addEventListener('input', scheduleCheck);
+
 vscode.postMessage({ type: 'requestActiveFile' });
+// Initial connectivity check
+triggerCheck();
 </script>
 </body>
 </html>`;
