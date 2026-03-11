@@ -64,7 +64,7 @@ jobs: dict = {}
 PYNGUIN_ALGORITHMS   = ["RANDOM", "WHOLE_SUITE", "DYNAMOSA"]
 
 # ── Refactoring constants ──────────────────────────────────────────────────────
-REFACTOR_MODELS      = ["deepseek-coder:1.3b", "starcoder", "codellama:7b"]
+REFACTOR_MODELS      = ["deepseek-coder:1.3b", "starcoder2:3b", "codellama:7b"]
 PPO_MAX_ITERATIONS   = 5
 PPO_REWARD_THRESHOLD = 0.6
 REWARD_WEIGHTS       = {"cyclomatic": 0.35, "pep8": 0.30, "halstead": 0.20, "loc": 0.15}
@@ -603,7 +603,7 @@ def analyze_test_quality(test_code: str, source_code: Optional[str] = None) -> Q
 
 class ModelType(Enum):
     DEEPSEEK_CODER = "deepseek-coder:1.3b"
-    STARCODER      = "starcoder"
+    STARCODER      = "starcoder2:3b"
     CODELLAMA      = "codellama:7b"
     LLAMA_CODE     = "llama3:code"
 
@@ -681,7 +681,7 @@ class EnsembleTestGenerator:
 
     def _generate_from_model(self, code, model):
         start_time = time.time()
-        prompt = (self._starcoder_prompt(code) if "starcoder" in model.value
+        prompt = (self._starcoder_prompt(code) if "starcoder2:3b" in model.value
                   else self._chat_prompt(code))
         try:
             result = subprocess.run(
