@@ -79,7 +79,6 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
           await this.pickZipFile();
           break;
 
-        // ── NEW: job-based single generation ──────────────────────────
         case "generateSingle":
           await this.handleSingleGeneration(
             msg.filePath,
@@ -88,16 +87,19 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
           );
           break;
 
-        // ── NEW: job-based multiple generation ────────────────────────
         case "generateMultiple":
           await this.handleMultipleGeneration(msg.filePaths, msg.backendUrl);
           break;
 
+        // analysisMode is now forwarded from the webview ("single" | "ensemble")
         case "generateZip":
-          await this.handleZipGeneration(msg.zipPath, msg.backendUrl);
+          await this.handleZipGeneration(
+            msg.zipPath,
+            msg.backendUrl,
+            msg.analysisMode ?? "single",
+          );
           break;
 
-        // Unified poll handler (single / multiple / zip all use same endpoint)
         case "pollJob":
           await this.pollJob(msg.jobId, msg.backendUrl, msg.scope);
           break;
@@ -170,10 +172,6 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
 
   // ── Generation handlers ─────────────────────────────────────────────────
 
-  /**
-   * Single file: read code → POST /generate-tests → get job_id → start polling.
-   * Same polling flow as ZIP.
-   */
   private async handleSingleGeneration(
     filePath: string,
     dirPath: string,
@@ -199,10 +197,9 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
           directory: dirPath,
           file_path: filePath,
         },
-        { timeout: 30000 }, // short — just submitting the job
+        { timeout: 30000 },
       );
 
-      // data = { job_id, message, scope }
       this._view?.webview.postMessage({
         type: "jobStarted",
         scope: "single",
@@ -218,10 +215,6 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /**
-   * Multiple files: read all files → POST /generate-tests-multiple → job_id → poll.
-   * All file contents are sent in one request so the backend can build cross-file context.
-   */
   private async handleMultipleGeneration(
     filePaths: string[],
     backendUrl: string,
@@ -232,7 +225,6 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
     });
 
     try {
-      // Read all files in parallel
       const files = await Promise.all(
         filePaths.map(async (fp) => {
           const code = Buffer.from(
@@ -250,10 +242,9 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
       const { data } = await axios.post(
         `${backendUrl}/generate-tests-multiple`,
         { files },
-        { timeout: 30000 }, // short — just submitting the job
+        { timeout: 30000 },
       );
 
-      // data = { job_id, message, scope }
       this._view?.webview.postMessage({
         type: "jobStarted",
         scope: "multiple",
@@ -270,7 +261,15 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async handleZipGeneration(zipPath: string, backendUrl: string) {
+  /**
+   * ZIP generation — now accepts analysisMode ("single" | "ensemble") and
+   * forwards it as a multipart form field to the backend /analyze_zip endpoint.
+   */
+  private async handleZipGeneration(
+    zipPath: string,
+    backendUrl: string,
+    analysisMode: "single" | "ensemble" = "single",
+  ) {
     this._view?.webview.postMessage({
       type: "generationStarted",
       scope: "zip",
@@ -282,13 +281,29 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
       const boundary = `----CodBoundary${Date.now()}`;
       const CRLF = "\r\n";
 
-      const header = Buffer.from(
+      // Build multipart body with the file field + analysis_mode field
+      const fileHeader = Buffer.from(
         `--${boundary}${CRLF}` +
           `Content-Disposition: form-data; name="file"; filename="${fileName}"${CRLF}` +
           `Content-Type: application/zip${CRLF}${CRLF}`,
       );
-      const footer = Buffer.from(`${CRLF}--${boundary}--${CRLF}`);
-      const body = Buffer.concat([header, zipBuffer, footer]);
+      const fileSeparator = Buffer.from(`${CRLF}`);
+
+      const modeField = Buffer.from(
+        `--${boundary}${CRLF}` +
+          `Content-Disposition: form-data; name="analysis_mode"${CRLF}${CRLF}` +
+          `${analysisMode}${CRLF}`,
+      );
+
+      const footer = Buffer.from(`--${boundary}--${CRLF}`);
+
+      const body = Buffer.concat([
+        fileHeader,
+        zipBuffer,
+        fileSeparator,
+        modeField,
+        footer,
+      ]);
 
       const { data } = await axios.post(`${backendUrl}/analyze_zip`, body, {
         headers: {
@@ -303,6 +318,7 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
         scope: "zip",
         jobId: data.job_id,
         backendUrl,
+        analysisMode,
       });
     } catch (err) {
       this._view?.webview.postMessage({
@@ -313,10 +329,6 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /**
-   * Unified poll — same /status/{jobId} endpoint for all scopes.
-   * The webview passes scope so we can route the result correctly.
-   */
   private async pollJob(jobId: string, backendUrl: string, scope: string) {
     try {
       const { data } = await axios.get(`${backendUrl}/status/${jobId}`, {
@@ -617,6 +629,35 @@ input[type=text]::placeholder{color:var(--muted2)}
 .btn-ghost{background:var(--surf);color:var(--muted);border:1px solid var(--bd);width:auto;padding:7px 11px;font-size:11px;}
 .btn-ghost:hover{color:var(--text);border-color:var(--bd2)}
 
+/* ─── Analysis mode toggle ────────────────────────────────── */
+.mode-toggle{
+  display:flex;gap:2px;margin-bottom:12px;
+  background:var(--surf2);border:1px solid var(--bd);
+  border-radius:var(--r);padding:3px;
+}
+.mtog{
+  flex:1;padding:6px 4px;border:none;background:transparent;
+  color:var(--muted);font-family:var(--mono);font-size:10px;
+  font-weight:500;letter-spacing:.04em;cursor:pointer;
+  border-radius:5px;transition:all .17s var(--ease);
+  display:flex;align-items:center;justify-content:center;gap:5px;
+}
+.mtog:hover:not(.on){background:rgba(255,255,255,.04);color:var(--text)}
+.mtog.on.single{
+  background:var(--aclo);color:var(--accent2);
+  border:1px solid var(--acbd);
+}
+.mtog.on.ensemble{
+  background:rgba(245,166,35,0.10);color:var(--amber);
+  border:1px solid rgba(245,166,35,0.28);
+}
+.mode-desc{
+  font-size:9px;color:var(--muted);margin-bottom:10px;
+  padding:6px 9px;background:var(--surf2);border:1px solid var(--bd);
+  border-radius:5px;line-height:1.6;
+}
+.mode-desc .hi{color:var(--text)}
+
 /* ─── Helpers ─────────────────────────────────────────────── */
 .row{display:flex;gap:8px;align-items:flex-end;margin-bottom:12px}
 .mb{margin-bottom:12px}.fld{margin-bottom:12px}
@@ -628,6 +669,7 @@ input[type=text]::placeholder{color:var(--muted2)}
 .loader.on{display:flex}
 .ring{width:22px;height:22px;border-radius:50%;border:2px solid var(--bd2);border-top-color:var(--accent);animation:spin .7s linear infinite;}
 .ring.green{border-top-color:var(--green)}
+.ring.amber{border-top-color:var(--amber)}
 .loader-txt{font-size:10px;color:var(--muted);letter-spacing:.06em}
 
 /* ─── Status pill ─────────────────────────────────────────── */
@@ -644,6 +686,7 @@ input[type=text]::placeholder{color:var(--muted2)}
 /* ─── Progress bar ────────────────────────────────────────── */
 .progress-wrap{background:var(--surf2);border:1px solid var(--bd);border-radius:20px;height:5px;overflow:hidden;margin-bottom:6px;}
 .progress-bar{height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));border-radius:20px;transition:width .4s var(--ease);width:0%;}
+.progress-bar.amber{background:linear-gradient(90deg,var(--amber),#f8c96a);}
 .progress-label{font-size:9.5px;color:var(--muted);text-align:center;margin-bottom:8px}
 
 /* ─── Results card ────────────────────────────────────────── */
@@ -673,6 +716,7 @@ input[type=text]::placeholder{color:var(--muted2)}
 .tag{display:inline-flex;align-items:center;justify-content:center;font-size:8.5px;padding:2px 6px;border-radius:4px;letter-spacing:.04em;}
 .tag.ok{background:var(--greenlo);color:var(--green);border:1px solid var(--greenbd)}
 .tag.err{background:var(--redlo);color:var(--red);border:1px solid var(--redbd)}
+.tag.ens{background:rgba(245,166,35,.1);color:var(--amber);border:1px solid rgba(245,166,35,.28)}
 
 /* ─── ZIP result ──────────────────────────────────────────── */
 .zip-result{display:none;margin-top:16px;background:var(--surf);border:1px solid var(--bd);border-radius:var(--r);overflow:hidden;}
@@ -680,7 +724,8 @@ input[type=text]::placeholder{color:var(--muted2)}
 .zr-hdr{padding:8px 12px;border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between}
 .zr-title{font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
 .zr-body{padding:10px 12px;max-height:220px;overflow-y:auto}
-.zr-row{display:grid;grid-template-columns:1fr 56px 56px 60px;gap:6px;align-items:center;padding:5px 0;border-bottom:1px solid var(--bd);font-size:10.5px;}
+/* ZIP rows have an extra "Method" column */
+.zr-row{display:grid;grid-template-columns:1fr 46px 46px 52px 52px;gap:5px;align-items:center;padding:5px 0;border-bottom:1px solid var(--bd);font-size:10.5px;}
 .zr-row:last-child{border-bottom:none}
 .zr-row.hd{font-size:9px;color:var(--muted);letter-spacing:.07em;text-transform:uppercase}
 .dl-link{color:var(--accent2);text-decoration:none;font-size:9.5px}
@@ -799,8 +844,25 @@ input[type=text]::placeholder{color:var(--muted2)}
     <div class="row mb">
       <button class="btn btn-ghost" onclick="pickZip()">Browse ZIP</button>
     </div>
+
+    <!-- ── Analysis mode toggle (new) ─────────────────────────────── -->
+    <div class="lbl" style="margin-bottom:6px">Analysis Mode</div>
+    <div class="mode-toggle">
+      <button class="mtog single on" id="mtog-single" onclick="setMode('single')">
+        ⬡ Single Model
+      </button>
+      <button class="mtog ensemble" id="mtog-ensemble" onclick="setMode('ensemble')">
+        ◈ Ensemble
+      </button>
+    </div>
+    <div class="mode-desc" id="mode-desc">
+      <span class="hi">Single Model</span> — fast analysis using <span class="hi">deepseek-coder:1.3b</span>.
+      Good for most codebases.
+    </div>
+    <!-- ── end mode toggle ──────────────────────────────────────────── -->
+
     <button class="btn btn-violet" id="btn-zip" onclick="genZip()" disabled>⬡ Analyse Codebase</button>
-    <div class="loader" id="ld-zip"><div class="ring"></div><span class="loader-txt" id="ld-zip-txt">Uploading…</span></div>
+    <div class="loader" id="ld-zip"><div class="ring" id="zip-ring"></div><span class="loader-txt" id="ld-zip-txt">Uploading…</span></div>
     <div class="progress-wrap" id="zip-prog-wrap" style="display:none"><div class="progress-bar" id="zip-prog-bar"></div></div>
     <div class="progress-label" id="zip-prog-lbl" style="display:none"></div>
     <div class="pill" id="pill-zip"><span class="pdot"></span><span id="pill-zip-txt"></span></div>
@@ -810,7 +872,7 @@ input[type=text]::placeholder{color:var(--muted2)}
         <a class="dl-link" id="zr-dl" href="#" style="display:none">↓ Download All Tests</a>
       </div>
       <div class="zr-body">
-        <div class="zr-row hd"><div>File</div><div class="mt-val">Cov%</div><div class="mt-val">Mut</div><div class="mt-val">Status</div></div>
+        <div class="zr-row hd"><div>File</div><div class="mt-val">Cov%</div><div class="mt-val">Mut</div><div class="mt-val">Method</div><div class="mt-val">Status</div></div>
         <div id="zr-rows"></div>
       </div>
     </div>
@@ -851,8 +913,8 @@ let singleDirPath  = '';
 let multiFilePaths = [];
 let zipFilePath    = '';
 let refactorPath   = '';
+let zipAnalysisMode = 'single';   // 'single' | 'ensemble'
 
-// Per-scope poll timers  { single: id, multiple: id, zip: id }
 const pollTimers = {};
 
 /* ── Tab switching ─────────────────────────────────── */
@@ -867,6 +929,27 @@ function iSwitch(id, btn) {
   document.querySelectorAll('.spanel').forEach(p => p.classList.remove('on'));
   btn.classList.add('on');
   document.getElementById('sp-' + id).classList.add('on');
+}
+
+/* ── Analysis mode toggle ──────────────────────────── */
+function setMode(mode) {
+  zipAnalysisMode = mode;
+  document.getElementById('mtog-single').classList.toggle('on', mode === 'single');
+  document.getElementById('mtog-ensemble').classList.toggle('on', mode === 'ensemble');
+
+  const desc = document.getElementById('mode-desc');
+  const bar  = document.getElementById('zip-prog-bar');
+  const ring = document.getElementById('zip-ring');
+
+  if (mode === 'single') {
+    desc.innerHTML = '<span class="hi">Single Model</span> — fast analysis using <span class="hi">deepseek-coder:1.3b</span>. Good for most codebases.';
+    bar.classList.remove('amber');
+    ring.classList.remove('amber');
+  } else {
+    desc.innerHTML = '<span class="hi">Ensemble</span> — runs <span class="hi">deepseek-coder, starcoder &amp; codellama</span> in parallel, then merges the best tests. Slower but higher quality.';
+    bar.classList.add('amber');
+    ring.classList.add('amber');
+  }
 }
 
 /* ── Polling ───────────────────────────────────────── */
@@ -950,13 +1033,15 @@ function pickZip() {
 function genZip() {
   if (!zipFilePath) { showPill('zip','err','No ZIP selected'); return; }
   const backendUrl = document.getElementById('backendUrl').value.trim();
-  setLoader('zip', true, 'Uploading ZIP…');
+  const modeLabel  = zipAnalysisMode === 'ensemble' ? 'Uploading (ensemble)…' : 'Uploading ZIP…';
+  setLoader('zip', true, modeLabel);
   hidePill('zip');
   document.getElementById('zr-main').classList.remove('on');
   document.getElementById('btn-zip').disabled = true;
   document.getElementById('zip-prog-wrap').style.display = 'none';
   document.getElementById('zip-prog-lbl').style.display  = 'none';
-  vscode.postMessage({ type:'generateZip', zipPath:zipFilePath, backendUrl });
+  // Pass analysisMode to the extension host
+  vscode.postMessage({ type:'generateZip', zipPath:zipFilePath, backendUrl, analysisMode:zipAnalysisMode });
 }
 
 /* ── Refactor ──────────────────────────────────────── */
@@ -998,7 +1083,7 @@ function scoreClass(pct) { return pct >= 70 ? 'g' : pct >= 40 ? 'a' : 'r'; }
 function esc(t) { const d=document.createElement('div'); d.textContent=t; return d.innerHTML; }
 function ts()   { return new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}); }
 
-/* ── Render result rows (shared for multi + zip) ───── */
+/* ── Render rows for multi panel ───────────────────── */
 function renderMultiRows(results, container) {
   container.innerHTML = '';
   results.forEach(r => {
@@ -1016,13 +1101,33 @@ function renderMultiRows(results, container) {
   });
 }
 
-/* ── Job completion handler (single / multiple / zip) ─ */
+/* ── Render rows for ZIP panel (has extra Method column) */
+function renderZipRows(results, container) {
+  container.innerHTML = '';
+  results.forEach(r => {
+    const cov = r.metrics?.coverage_percent ?? (r.coverage != null ? Math.round(r.coverage*100) : null);
+    const mut = r.metrics?.mutation_score   != null ? Math.round(r.metrics.mutation_score*100)
+              : r.mutation_score            != null ? Math.round(r.mutation_score*100) : null;
+    const method = r.generation_method || '—';
+    const isEns  = method === 'ensemble';
+    const row = document.createElement('div');
+    row.className = 'zr-row';
+    row.innerHTML = \`
+      <div class="mt-file" title="\${esc(r.file)}">\${esc(r.file)}</div>
+      <div class="mt-val \${cov!=null?scoreClass(cov):''}">\${cov!=null?cov+'%':'—'}</div>
+      <div class="mt-val \${mut!=null?scoreClass(mut):''}">\${mut!=null?mut+'%':'—'}</div>
+      <div class="mt-val"><span class="tag \${isEns?'ens':'ok'}">\${isEns?'ensemble':'single'}</span></div>
+      <div class="mt-val"><span class="tag \${r.status==='success'?'ok':'err'}">\${r.status}</span></div>\`;
+    container.appendChild(row);
+  });
+}
+
+/* ── Job completion handler ────────────────────────── */
 function handleJobComplete(scope, jobData) {
   stopPolling(scope);
   setLoader(scope, false);
   hideProgress(scope);
 
-  // Re-enable button
   const btnMap = { single:'btn-single', multiple:'btn-multi', zip:'btn-zip' };
   document.getElementById(btnMap[scope]).disabled = false;
 
@@ -1057,14 +1162,14 @@ function handleJobComplete(scope, jobData) {
     renderMultiRows(results, document.getElementById('mt-rows'));
     document.getElementById('mt-table').classList.add('on');
 
-    if (jobData.download_url) {
-      // optionally surface download link — re-use zr-dl in the multi panel if desired
-    }
-
   } else if (scope === 'zip') {
-    const ok = results.filter(r => r.status==='success').length;
-    showPill('zip','ok', \`\${ok}/\${results.length} files analysed\`);
-    renderMultiRows(results, document.getElementById('zr-rows'));
+    const ok    = results.filter(r => r.status==='success').length;
+    const mode  = jobData.analysis_mode || zipAnalysisMode;
+    const label = mode === 'ensemble'
+      ? \`\${ok}/\${results.length} files analysed (ensemble)\`
+      : \`\${ok}/\${results.length} files analysed\`;
+    showPill('zip', 'ok', label);
+    renderZipRows(results, document.getElementById('zr-rows'));
     if (jobData.download_url) {
       const dlEl = document.getElementById('zr-dl');
       dlEl.href = document.getElementById('backendUrl').value.trim() + jobData.download_url;
@@ -1117,10 +1222,9 @@ window.addEventListener('message', ev => {
     case 'generationStarted':
       break;
 
-    // ── NEW: job submitted → start polling ──────────────────────────
     case 'jobStarted': {
-      const scope = m.scope === 'multiple' ? 'multiple' : m.scope; // 'single'|'multiple'|'zip'
-      const uiScope = scope === 'multiple' ? 'multi' : scope;      // maps to element ids
+      const scope   = m.scope;
+      const uiScope = scope === 'multiple' ? 'multi' : scope;
 
       setLoader(uiScope, true, 'Running pipeline…');
 
@@ -1130,25 +1234,30 @@ window.addEventListener('message', ev => {
       if (scope === 'single') {
         showProgress('single', 0, 'Processing…');
       }
+      if (scope === 'zip') {
+        const modeLabel = (m.analysisMode === 'ensemble') ? 'Running ensemble pipeline…' : 'Running pipeline…';
+        setLoader('zip', true, modeLabel);
+        showProgress('zip', 0, 'Processing…');
+      }
 
       startPolling(scope, m.jobId, m.backendUrl);
       break;
     }
 
-    // ── Poll result ─────────────────────────────────────────────────
     case 'jobStatus': {
-      const scope   = m.scope;                                   // 'single'|'multiple'|'zip'
+      const scope   = m.scope;
       const uiScope = scope === 'multiple' ? 'multi' : scope;
       const s       = m.status;
 
       if (s.status === 'queued' || s.status === 'processing') {
         const pct  = s.progress || 0;
         const file = s.current_file ? \` — \${s.current_file}\` : '';
-        const lbl  = scope === 'single'
-          ? \`\${pct}%\${file}\`
-          : \`\${pct}%\${file}\`;
+        const lbl  = \`\${pct}%\${file}\`;
 
-        setLoader(uiScope, true, s.status === 'queued' ? 'Queued…' : 'Running pipeline…');
+        const runningTxt = (scope === 'zip' && zipAnalysisMode === 'ensemble')
+          ? 'Running ensemble pipeline…'
+          : 'Running pipeline…';
+        setLoader(uiScope, true, s.status === 'queued' ? 'Queued…' : runningTxt);
         showProgress(uiScope, pct, lbl);
 
         if (scope === 'multiple' && s.total_files) {
@@ -1157,13 +1266,11 @@ window.addEventListener('message', ev => {
             \`Processing \${done}/\${s.total_files}…\`;
         }
       } else {
-        // completed or error
         handleJobComplete(scope, s);
       }
       break;
     }
 
-    // Legacy direct-result messages kept for safety
     case 'generationComplete': {
       if (m.scope === 'single') {
         setLoader('single', false);
