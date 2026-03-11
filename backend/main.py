@@ -53,6 +53,12 @@ class SingleFileRequest(BaseModel):
     ollama_url:     str = "http://localhost:11434"
     ollama_timeout: int = 120
 
+class MultipleFileRequest(BaseModel):
+    files: list  # list of {code, module_name, directory, file_path}
+    ollama_model:   str = "deepseek-coder:1.3b"
+    ollama_url:     str = "http://localhost:11434"
+    ollama_timeout: int = 120
+
 class SingleFileResponse(BaseModel):
     tests: str
     coverage: float
@@ -79,7 +85,6 @@ class RefactorResponse(BaseModel):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def call_ollama(prompt: str, ollama_url: str, model: str, timeout: int) -> str:
-    """Send a prompt to Ollama and return the raw response text."""
     response = requests.post(
         f"{ollama_url}/api/generate",
         json={
@@ -106,7 +111,6 @@ def generate_tests_ollama(
     model: str = "deepseek-coder:1.3b",
     timeout: int = 120,
 ) -> str:
-    """Ask Ollama to write pytest tests for the given code."""
     context_block = f"\n\n# Context from other project files:\n{context}" if context else ""
     prompt = f"""You are an expert Python test engineer. Write comprehensive pytest tests for the following Python module.
 
@@ -141,7 +145,6 @@ def refactor_code_ollama(
     model: str = "deepseek-coder:1.3b",
     timeout: int = 120,
 ) -> tuple[str, str]:
-    """Ask Ollama to refactor the code. Returns (refactored_code, summary)."""
     prompt = f"""You are an expert Python software engineer specialising in clean code and refactoring.
 
 Refactor the following Python module to improve:
@@ -191,7 +194,6 @@ def _parse_refactor_response(raw: str, original: str) -> tuple[str, str]:
 
 
 def _clean_code(raw: str) -> str:
-    """Strip markdown fences from an LLM code response."""
     lines = raw.strip().split("\n")
     cleaned, in_block, found_fence = [], False, False
 
@@ -214,11 +216,10 @@ def _clean_code(raw: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Project context extraction  (mirrors Flask get_file_context)
+# Project context extraction
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_file_context(target_file: str, all_files: list) -> str:
-    """Build a compact API summary of all project files except the target."""
     context = []
     for fp in all_files:
         if fp == target_file:
@@ -374,8 +375,207 @@ def _parse_mutation_score(output: str) -> float:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ZIP background worker  (mirrors Flask process_zip_job)
+# Shared: process one file inside a job (used by single + multiple workers)
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _process_one_file(
+    job_id: str,
+    code: str,
+    module_name: str,
+    file_path: str,
+    ollama_url: str,
+    model: str,
+    timeout: int,
+    context: str = "",
+) -> dict:
+    """
+    Generate tests + metrics for a single file.
+    Updates jobs[job_id]['current_file'] while running.
+    Returns a result dict (same schema as ZIP job results).
+    """
+    jobs[job_id]["current_file"] = f"{module_name}.py"
+    work_dir = tempfile.mkdtemp(prefix="codexter_")
+    entry = {"file": f"{module_name}.py", "status": "pending"}
+
+    try:
+        # Write source so pytest can import it
+        src_path = os.path.join(work_dir, f"{module_name}.py")
+        with open(src_path, "w") as f:
+            f.write(code)
+        with open(os.path.join(work_dir, "__init__.py"), "w") as f:
+            f.write("")
+
+        # ── Generate tests ────────────────────────────────────────────────
+        tests = generate_tests_ollama(
+            code=code,
+            module_name=module_name,
+            context=context,
+            ollama_url=ollama_url,
+            model=model,
+            timeout=timeout,
+        )
+        if not tests or not tests.strip():
+            raise ValueError("Ollama returned empty tests")
+
+        ast.parse(tests)  # validate syntax
+
+        # Save to TESTS_FOLDER so it can be bundled into a download ZIP
+        out_name = f"test_{module_name}.py"
+        out_path = os.path.join(TESTS_FOLDER, out_name)
+        with open(out_path, "w") as tf:
+            tf.write(tests)
+
+        test_path = os.path.join(work_dir, out_name)
+        with open(test_path, "w") as tf:
+            tf.write(tests)
+
+        # ── Metrics ───────────────────────────────────────────────────────
+        try:
+            cov, _ = calculate_coverage(src_path, test_path, work_dir)
+            mut, _ = calculate_mutation_score(module_name, test_path, work_dir)
+            metrics = {
+                "coverage_percent": round(cov * 100, 2),
+                "mutation_score":   round(mut, 4),
+                "has_errors":       False,
+            }
+        except Exception:
+            cov, mut = 0.0, 0.0
+            metrics = {"coverage_percent": 0.0, "mutation_score": 0.0, "has_errors": True}
+
+        entry.update({
+            "status":      "success",
+            "test_file":   out_name,
+            "full_path":   out_path,
+            "content":     tests,
+            "coverage":    cov,
+            "mutation_score": mut,
+            "metrics":     metrics,
+        })
+
+    except SyntaxError as e:
+        entry["status"] = "failed"
+        entry["error"]  = f"LLM returned invalid Python: {e}"
+    except Exception as e:
+        entry["status"] = "failed"
+        entry["error"]  = str(e)
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+    return entry
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Background workers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def process_single_job(
+    job_id: str,
+    code: str,
+    module_name: str,
+    file_path: str,
+    ollama_url: str,
+    model: str,
+    timeout: int,
+):
+    """Background worker for a single-file job."""
+    jobs[job_id]["status"]   = "processing"
+    jobs[job_id]["progress"] = 0
+    jobs[job_id]["total_files"] = 1
+
+    try:
+        entry = _process_one_file(
+            job_id=job_id,
+            code=code,
+            module_name=module_name,
+            file_path=file_path,
+            ollama_url=ollama_url,
+            model=model,
+            timeout=timeout,
+        )
+
+        jobs[job_id]["results"]  = [entry]
+        jobs[job_id]["progress"] = 100
+
+        if entry["status"] == "success":
+            cov = entry.get("coverage", 0.0)
+            mut = entry.get("mutation_score", 0.0)
+            jobs[job_id]["status"]  = "completed"
+            jobs[job_id]["message"] = (
+                f"Tests generated. Coverage: {cov:.1%}, Mutation: {mut:.1%}"
+            )
+            # Build a single-file download ZIP
+            results_zip = os.path.join(UPLOAD_FOLDER, f"tests_{job_id}.zip")
+            with zipfile.ZipFile(results_zip, "w") as zout:
+                zout.write(entry["full_path"], entry["test_file"])
+            jobs[job_id]["download_url"] = f"/download_tests/{job_id}"
+        else:
+            jobs[job_id]["status"] = "error"
+            jobs[job_id]["error"]  = entry.get("error", "Unknown error")
+
+    except Exception as e:
+        jobs[job_id]["status"] = "error"
+        jobs[job_id]["error"]  = str(e)
+        print(traceback.format_exc())
+
+
+def process_multiple_job(
+    job_id: str,
+    files: list,       # list of dicts: {code, module_name, directory, file_path}
+    ollama_url: str,
+    model: str,
+    timeout: int,
+):
+    """Background worker for a multiple-file job."""
+    jobs[job_id]["status"]      = "processing"
+    jobs[job_id]["progress"]    = 0
+    jobs[job_id]["results"]     = []
+    jobs[job_id]["total_files"] = len(files)
+
+    # Build a list of real file paths for cross-file context
+    # (only those that are actual paths on disk; code passed directly won't have them)
+    all_real_paths = [f["file_path"] for f in files if os.path.isfile(f.get("file_path", ""))]
+
+    try:
+        for i, file_info in enumerate(files):
+            code        = file_info["code"]
+            module_name = file_info["module_name"]
+            file_path   = file_info.get("file_path", "")
+
+            jobs[job_id]["current_file"] = f"{module_name}.py"
+
+            # Build context from sibling files (mirrors ZIP behaviour)
+            context = get_file_context(file_path, all_real_paths) if all_real_paths else ""
+
+            entry = _process_one_file(
+                job_id=job_id,
+                code=code,
+                module_name=module_name,
+                file_path=file_path,
+                ollama_url=ollama_url,
+                model=model,
+                timeout=timeout,
+                context=context,
+            )
+
+            jobs[job_id]["results"].append(entry)
+            jobs[job_id]["progress"] = int(((i + 1) / len(files)) * 100)
+
+        # Bundle all generated test files into a download ZIP
+        results_zip = os.path.join(UPLOAD_FOLDER, f"tests_{job_id}.zip")
+        with zipfile.ZipFile(results_zip, "w") as zout:
+            for r in jobs[job_id]["results"]:
+                if r["status"] == "success" and "full_path" in r:
+                    zout.write(r["full_path"], r["test_file"])
+
+        jobs[job_id]["download_url"] = f"/download_tests/{job_id}"
+        jobs[job_id]["status"]       = "completed"
+        jobs[job_id]["message"]      = "All files processed"
+
+    except Exception as e:
+        jobs[job_id]["status"] = "error"
+        jobs[job_id]["error"]  = str(e)
+        print(traceback.format_exc())
+
 
 def process_zip_job(
     job_id: str,
@@ -431,24 +631,22 @@ def process_zip_job(
                 if not tests or not tests.strip():
                     raise ValueError("Ollama returned empty tests")
 
-                ast.parse(tests)   # validate syntax
+                ast.parse(tests)
 
                 out_name = f"test_{module_name}.py"
                 out_path = os.path.join(TESTS_FOLDER, out_name)
                 with open(out_path, "w", encoding="utf-8") as tf:
                     tf.write(tests)
 
-                # Metrics (best-effort; don't fail the job if they error)
                 try:
-                    cov,  cov_logs = calculate_coverage(py_file, out_path, extract_path)
-                    mut,  mut_logs = calculate_mutation_score(module_name, out_path, extract_path)
+                    cov, _ = calculate_coverage(py_file, out_path, extract_path)
+                    mut, _ = calculate_mutation_score(module_name, out_path, extract_path)
                     metrics_summary = {
                         "coverage_percent": round(cov * 100, 2),
                         "mutation_score":   round(mut, 4),
                         "has_errors":       False,
                     }
-                except Exception as me:
-                    cov_logs = mut_logs = []
+                except Exception:
                     metrics_summary = {"coverage_percent": 0.0, "mutation_score": 0.0, "has_errors": True}
 
                 entry.update({
@@ -469,7 +667,6 @@ def process_zip_job(
             jobs[job_id]["results"].append(entry)
             jobs[job_id]["progress"] = int(((i + 1) / total) * 100)
 
-        # Bundle results into a downloadable ZIP
         results_zip = os.path.join(UPLOAD_FOLDER, f"tests_{job_id}.zip")
         with zipfile.ZipFile(results_zip, "w") as zout:
             for r in jobs[job_id]["results"]:
@@ -490,88 +687,86 @@ def process_zip_job(
 # Routes
 # ══════════════════════════════════════════════════════════════════════════════
 
-@app.post("/generate-tests", response_model=SingleFileResponse)
+@app.post("/generate-tests")
 async def generate_tests_endpoint(req: SingleFileRequest):
     """
-    Single-file test generation (used by the VSCode extension):
-    1. Generate tests via Ollama
-    2. Calculate coverage with pytest-cov
-    3. Calculate mutation score with mutmut
+    Single-file test generation — now job-based (same as ZIP).
+    Returns {job_id} immediately; poll /status/{job_id} for results.
     """
-    logs     = []
-    work_dir = tempfile.mkdtemp(prefix="codexter_")
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {
+        "status":       "queued",
+        "submitted_at": time.time(),
+        "filename":     f"{req.module_name}.py",
+        "scope":        "single",
+    }
 
-    try:
-        # Write source to temp dir so pytest can import it
-        src_path = os.path.join(work_dir, f"{req.module_name}.py")
-        with open(src_path, "w") as f:
-            f.write(req.code)
-        with open(os.path.join(work_dir, "__init__.py"), "w") as f:
-            f.write("")
+    thread = threading.Thread(
+        target=process_single_job,
+        args=(
+            job_id,
+            req.code,
+            req.module_name,
+            req.file_path,
+            req.ollama_url,
+            req.ollama_model,
+            req.ollama_timeout,
+        ),
+        daemon=True,
+    )
+    thread.start()
 
-        # ── 1. Generate tests ──────────────────────────────────────────────
-        logs.append("=== Step 1: Ollama Test Generation ===")
-        try:
-            tests = generate_tests_ollama(
-                code=req.code,
-                module_name=req.module_name,
-                ollama_url=req.ollama_url,
-                model=req.ollama_model,
-                timeout=req.ollama_timeout,
-            )
-            if not tests or not tests.strip():
-                raise ValueError("Ollama returned an empty response")
-            ast.parse(tests)
-            logs.append(f"Generated {len(tests)} characters of test code")
-        except SyntaxError as e:
-            raise HTTPException(status_code=500, detail={
-                "error": f"LLM returned invalid Python syntax: {e}", "logs": logs})
-        except requests.exceptions.ConnectionError:
-            raise HTTPException(status_code=500, detail={
-                "error": f"Cannot connect to Ollama at {req.ollama_url}. Is it running?", "logs": logs})
-        except requests.exceptions.Timeout:
-            raise HTTPException(status_code=500, detail={
-                "error": "Ollama request timed out. Try a higher ollama_timeout.", "logs": logs})
+    return {"message": "Job submitted", "job_id": job_id, "scope": "single"}
 
-        # ── Write test file ────────────────────────────────────────────────
-        test_path = os.path.join(work_dir, f"test_{req.module_name}.py")
-        with open(test_path, "w") as f:
-            f.write(tests)
 
-        # ── 2. Coverage ────────────────────────────────────────────────────
-        logs.append("\n=== Step 2: Coverage Analysis ===")
-        coverage_score, cov_logs = calculate_coverage(src_path, test_path, work_dir)
-        logs.extend(cov_logs)
+@app.post("/generate-tests-multiple")
+async def generate_tests_multiple_endpoint(req: MultipleFileRequest):
+    """
+    Multiple-file test generation — job-based.
+    
+    Expected body:
+    {
+      "files": [
+        {"code": "...", "module_name": "foo", "directory": "/path", "file_path": "/path/foo.py"},
+        ...
+      ],
+      "ollama_model": "deepseek-coder:1.3b",
+      "ollama_url": "http://localhost:11434",
+      "ollama_timeout": 120
+    }
 
-        # ── 3. Mutation ────────────────────────────────────────────────────
-        logs.append("\n=== Step 3: Mutation Testing ===")
-        mutation_score, mut_logs = calculate_mutation_score(req.module_name, test_path, work_dir)
-        logs.extend(mut_logs)
+    Returns {job_id} immediately; poll /status/{job_id} for results.
+    """
+    if not req.files:
+        raise HTTPException(status_code=400, detail="No files provided")
 
-        logs.append("\n=== Pipeline Complete ===")
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {
+        "status":       "queued",
+        "submitted_at": time.time(),
+        "total_files":  len(req.files),
+        "scope":        "multiple",
+    }
 
-        return SingleFileResponse(
-            tests=tests,
-            coverage=coverage_score,
-            mutation_score=mutation_score,
-            message=f"Tests generated. Coverage: {coverage_score:.1%}, Mutation: {mutation_score:.1%}",
-            pipeline_log=logs,
-        )
+    thread = threading.Thread(
+        target=process_multiple_job,
+        args=(
+            job_id,
+            req.files,
+            req.ollama_url,
+            req.ollama_model,
+            req.ollama_timeout,
+        ),
+        daemon=True,
+    )
+    thread.start()
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        logs.append(f"\n=== ERROR: {e} ===")
-        logs.append(traceback.format_exc())
-        print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail={"error": str(e), "logs": logs})
-    finally:
-        shutil.rmtree(work_dir, ignore_errors=True)
+    return {"message": "Job submitted", "job_id": job_id, "scope": "multiple"}
 
 
 @app.post("/refactor", response_model=RefactorResponse)
 async def refactor_endpoint(req: RefactorRequest):
-    """Refactor a Python file using Ollama."""
+    """Refactor a Python file using Ollama (synchronous — fast enough)."""
     try:
         refactored, summary = refactor_code_ollama(
             code=req.code,
@@ -600,11 +795,6 @@ async def analyze_zip(
     ollama_url:     str = "http://localhost:11434",
     ollama_timeout: int = 120,
 ):
-    """
-    Upload a ZIP of Python source files.
-    Returns a job_id immediately; poll /status/{job_id} for progress.
-    Download results from /download_tests/{job_id} when complete.
-    """
     if not file.filename.endswith(".zip"):
         raise HTTPException(status_code=400, detail="Only .zip files are accepted")
 
@@ -621,6 +811,7 @@ async def analyze_zip(
         "status":       "queued",
         "submitted_at": time.time(),
         "filename":     file.filename,
+        "scope":        "zip",
     }
 
     thread = threading.Thread(
@@ -650,13 +841,13 @@ async def download_tests(job_id: str):
     return FileResponse(
         zip_path,
         media_type="application/zip",
-        filename=f"generated_tests_{jobs[job_id]['filename']}.zip",
+        filename=f"generated_tests_{jobs[job_id].get('filename', job_id)}.zip",
     )
 
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "service": "Codexter", "version": "2.0.0"}
+    return {"status": "healthy", "service": "Codexter", "version": "2.1.0"}
 
 
 @app.get("/ollama-status")
