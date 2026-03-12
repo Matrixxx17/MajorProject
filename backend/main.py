@@ -21,6 +21,8 @@ import sys
 import re
 from typing import Dict, Any, List, Tuple, Optional, Set
 
+os.environ["PYNGUIN_DANGER_AWARE"] = "1"
+
 try:
     import pycodestyle
     _PYCODESTYLE_OK = True
@@ -63,6 +65,9 @@ jobs: dict = {}
 # ── Pynguin algorithms used for single-file generation ────────────────────────
 PYNGUIN_ALGORITHMS   = ["RANDOM", "WHOLE_SUITE", "DYNAMOSA"]
 
+# ── LLM models available for test generation ──────────────────────────────────
+LLM_TEST_MODELS      = ["deepseek-coder:1.3b", "codellama:7b"]
+
 # ── Refactoring constants ──────────────────────────────────────────────────────
 REFACTOR_MODELS      = ["deepseek-coder:1.3b", "starcoder2:3b", "codellama:7b"]
 PPO_MAX_ITERATIONS   = 5
@@ -101,9 +106,15 @@ class SingleFileRequest(BaseModel):
     module_name: str
     directory: str
     file_path: str
-    ollama_model:   str = "deepseek-coder:1.3b"
-    ollama_url:     str = "http://localhost:11434"
-    ollama_timeout: int = 120
+    ollama_model:    str = "deepseek-coder:1.3b"
+    ollama_url:      str = "http://localhost:11434"
+    ollama_timeout:  int = 120
+    # ── new: approach routing ──────────────────────────────────────────────
+    approach:        str = "hybrid"          # "pynguin" | "llm" | "hybrid"
+    selected_algos:  List[str] = ["RANDOM", "WHOLE_SUITE", "DYNAMOSA"]
+    selected_models: List[str] = ["deepseek-coder:1.3b"]
+    hybrid_algo:     str = "RANDOM"
+    hybrid_llm:      str = "deepseek-coder:1.3b"
 
 class MultipleFileRequest(BaseModel):
     files: list
@@ -124,7 +135,7 @@ class RefactorRequest(BaseModel):
     file_path: str
     ollama_model:   str = "deepseek-coder:1.3b"
     ollama_url:     str = "http://localhost:11434"
-    ollama_timeout: int = 120
+    ollama_timeout: int = 300
 
 class RefactorResponse(BaseModel):
     refactored_code: str
@@ -1092,8 +1103,68 @@ def _parse_mutation_score(output: str) -> float:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ★ NEW: Single-file Pynguin pipeline
+# ★  Single-file Pynguin pipeline
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _pynguin_search_time(code: str) -> int:
+    """
+    Return an appropriate Pynguin search time (seconds) based on code size/complexity.
+    Simple functions get a short budget; complex modules get more time.
+
+    Heuristic bands:
+      ≤  5 branches / ≤ 20 LOC  →  10 s   (trivial)
+      ≤ 15 branches / ≤ 60 LOC  →  20 s   (simple)
+      ≤ 30 branches / ≤150 LOC  →  35 s   (moderate)
+      >  30 branches / > 150 LOC →  60 s   (complex)
+    """
+    try:
+        metrics = _analyze_code_complexity(code)
+        branches = metrics.num_branches
+        loc      = metrics.lines_of_code
+        if branches <= 5  and loc <= 20:  return 10
+        if branches <= 15 and loc <= 60:  return 20
+        if branches <= 30 and loc <= 150: return 35
+        return 60
+    except Exception:
+        return 30  # safe default
+
+
+def _deduplicate_tests(raw_code: str) -> str:
+    """
+    Remove structurally duplicate test functions from Pynguin output.
+    Two tests are considered duplicates when their AST body is identical
+    (same assertions, same calls) regardless of variable names.
+    Keeps the first occurrence; preserves all imports and module-level code.
+    """
+    try:
+        tree = ast.parse(raw_code)
+    except SyntaxError:
+        return raw_code
+
+    seen_bodies: list = []
+    kept_nodes  = []
+
+    for node in tree.body:
+        if not (isinstance(node, ast.FunctionDef) and node.name.startswith("test_")):
+            kept_nodes.append(node)
+            continue
+
+        # Normalise: strip docstring, unparse body statements
+        body_stmts = node.body
+        if body_stmts and isinstance(body_stmts[0], ast.Expr) and isinstance(body_stmts[0].value, ast.Constant):
+            body_stmts = body_stmts[1:]  # skip docstring
+
+        fingerprint = tuple(ast.unparse(s) for s in body_stmts)
+        if fingerprint not in seen_bodies:
+            seen_bodies.append(fingerprint)
+            kept_nodes.append(node)
+
+    tree.body = kept_nodes
+    try:
+        return ast.unparse(tree)
+    except Exception:
+        return raw_code
+
 
 def _run_pynguin_algorithm(
     algorithm: str,
@@ -1101,14 +1172,8 @@ def _run_pynguin_algorithm(
     src_path: str,
     work_dir: str,
     timeout: int = 120,
+    source_code: str = "",
 ) -> dict:
-    """
-    Run Pynguin with one algorithm. Returns a result dict:
-    {
-        algorithm, status, test_code, coverage, mutation_score,
-        num_tests, error (if failed)
-    }
-    """
     out_dir = os.path.join(work_dir, f"pynguin_{algorithm.lower()}")
     os.makedirs(out_dir, exist_ok=True)
 
@@ -1123,6 +1188,14 @@ def _run_pynguin_algorithm(
     }
 
     try:
+        # Adaptive search budget based on code complexity
+        _src = source_code or ""
+        if not _src:
+            try:
+                with open(src_path) as _f: _src = _f.read()
+            except Exception: pass
+        search_time = _pynguin_search_time(_src)
+
         proc = subprocess.run(
             [
                 sys.executable, "-m", "pynguin",
@@ -1130,7 +1203,7 @@ def _run_pynguin_algorithm(
                 "--module-name", module_name,
                 "--output-path", out_dir,
                 "--algorithm", algorithm,
-                "--maximum-search-time", "60",
+                "--maximum-search-time", str(search_time),
                 "--assertion-generation", "MUTATION_ANALYSIS",
                 "-v",
             ],
@@ -1140,10 +1213,8 @@ def _run_pynguin_algorithm(
             env={**os.environ, "PYTHONPATH": os.path.dirname(src_path)},
         )
 
-        # Pynguin writes test_<module>.py into out_dir
         test_file = os.path.join(out_dir, f"test_{module_name}.py")
         if not os.path.exists(test_file):
-            # Try any .py file in out_dir
             py_files = [f for f in os.listdir(out_dir) if f.endswith(".py")]
             if py_files:
                 test_file = os.path.join(out_dir, py_files[0])
@@ -1162,11 +1233,30 @@ def _run_pynguin_algorithm(
             result["error"] = "Pynguin produced an empty test file"
             return result
 
+        # Remove structurally duplicate tests Pynguin tends to emit for simple code
+        raw_tests = _deduplicate_tests(raw_tests)
+
         result["test_code"] = raw_tests
         result["num_tests"] = raw_tests.count("def test_")
         result["status"] = "success"
 
-        # ── Metrics for this algo ────────────────────────────────────────
+        # ── Coverage: read from Pynguin statistics.csv ────────────────────
+        cov = 0.0
+        stats_csv = os.path.join(out_dir, "pynguin-report", "statistics.csv")
+        if os.path.exists(stats_csv):
+            try:
+                import csv as _csv
+                with open(stats_csv, newline="", encoding="utf-8") as _f:
+                    reader = _csv.DictReader(_f)
+                    rows = [r for r in reader
+                            if r.get("TargetModule", "").strip().strip('"') == module_name]
+                if rows:
+                    raw_cov = rows[-1].get("Coverage", "0").strip().strip('"')
+                    cov = float(raw_cov)
+            except Exception:
+                cov = 0.0
+
+        # ── Mutation score ────────────────────────────────────────────────
         mdir = tempfile.mkdtemp(prefix=f"codexter_{algorithm}_")
         try:
             shutil.copy(src_path, os.path.join(mdir, f"{module_name}.py"))
@@ -1174,14 +1264,12 @@ def _run_pynguin_algorithm(
             test_dest = os.path.join(mdir, f"test_{module_name}_{algorithm.lower()}.py")
             with open(test_dest, "w") as f:
                 f.write(raw_tests)
-
-            cov, _  = calculate_coverage(
-                os.path.join(mdir, f"{module_name}.py"), test_dest, mdir)
-            mut, _  = calculate_mutation_score(module_name, test_dest, mdir)
-            result["coverage"]       = cov
-            result["mutation_score"] = mut
+            mut, _ = calculate_mutation_score(module_name, test_dest, mdir)
         finally:
             shutil.rmtree(mdir, ignore_errors=True)
+
+        result["coverage"]       = cov
+        result["mutation_score"] = mut
 
     except subprocess.TimeoutExpired:
         result["status"] = "error"
@@ -1196,7 +1284,7 @@ def _run_pynguin_algorithm(
     return result
 
 
-def _refine_tests_with_deepseek(
+def _refine_tests_with_llm(
     algo_results: List[dict],
     source_code: str,
     module_name: str,
@@ -1205,7 +1293,7 @@ def _refine_tests_with_deepseek(
     timeout: int,
 ) -> dict:
     """
-    Passes all successful algo test outputs to DeepSeek for refinement.
+    Passes successful algo test outputs to the specified LLM for refinement.
     Returns { status, refined_code, error }.
     """
     successful = [r for r in algo_results if r["status"] == "success" and r["test_code"]]
@@ -1213,7 +1301,6 @@ def _refine_tests_with_deepseek(
         return {"status": "error", "refined_code": None,
                 "error": "No successful algo outputs to refine"}
 
-    # Build combined context showing all algo outputs
     combined_tests = "\n\n".join(
         f"# ── Tests from {r['algorithm']} "
         f"(cov: {r['coverage']:.1%}, mut: {r['mutation_score']:.1%}) ──\n"
@@ -1250,7 +1337,6 @@ Start directly with `import pytest`."""
         raw = call_ollama(prompt, ollama_url, model, timeout)
         refined = _clean_code(raw)
 
-        # Validate syntax — repair if needed
         try:
             ast.parse(refined)
         except SyntaxError:
@@ -1266,6 +1352,12 @@ Start directly with `import pytest`."""
         return {"status": "error", "refined_code": None, "error": str(e)}
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ★  Single-file: Pynguin-only worker
+#    Runs only the user-selected algorithms (sequentially for determinism,
+#    but threaded internally — same as before).
+# ══════════════════════════════════════════════════════════════════════════════
+
 def process_single_file_pynguin(
     job_id: str,
     code: str,
@@ -1274,76 +1366,57 @@ def process_single_file_pynguin(
     ollama_url: str,
     model: str,
     timeout: int,
+    selected_algos: Optional[List[str]] = None,
 ):
     """
-    Background worker for the new single-file pipeline:
-      1. Run RANDOM, WHOLE_SUITE, DYNAMOSA in parallel via Pynguin
-      2. Calculate coverage + mutation for each
-      3. Refine all outputs with DeepSeek
-      4. Post results to jobs[job_id]
+    Pynguin-only approach: runs selected algorithms, computes coverage + mutation
+    for each, returns per-algorithm results (no LLM refinement step).
     """
+    algos = [a for a in PYNGUIN_ALGORITHMS if a in (selected_algos or PYNGUIN_ALGORITHMS)]
+    if not algos:
+        algos = PYNGUIN_ALGORITHMS
+
     jobs[job_id]["status"]   = "processing"
     jobs[job_id]["progress"] = 0
     jobs[job_id]["phase"]    = "pynguin"
 
     work_dir = tempfile.mkdtemp(prefix="codexter_single_")
     try:
-        # Write source file
         src_path = os.path.join(work_dir, f"{module_name}.py")
         with open(src_path, "w") as f:
             f.write(code)
         open(os.path.join(work_dir, "__init__.py"), "w").close()
 
-        # ── Phase 1: Run all 3 Pynguin algorithms in parallel ────────────
-        jobs[job_id]["phase"]          = "pynguin"
-        jobs[job_id]["phase_label"]    = "Running Pynguin algorithms…"
-        jobs[job_id]["progress"]       = 10
+        jobs[job_id]["phase"]       = "pynguin"
+        jobs[job_id]["phase_label"] = f"Running {len(algos)} Pynguin algorithm(s)…"
+        jobs[job_id]["progress"]    = 10
 
         algo_results: List[dict] = []
 
         def _run_algo(algo: str) -> dict:
             return _run_pynguin_algorithm(
-                algorithm=algo,
-                module_name=module_name,
-                src_path=src_path,
-                work_dir=work_dir,
-                timeout=timeout,
+                algorithm=algo, module_name=module_name,
+                src_path=src_path, work_dir=work_dir, timeout=timeout,
+                source_code=code,
             )
 
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            futures = {executor.submit(_run_algo, algo): algo for algo in PYNGUIN_ALGORITHMS}
+        with ThreadPoolExecutor(max_workers=len(algos)) as executor:
+            futures = {executor.submit(_run_algo, algo): algo for algo in algos}
             done_count = 0
             for future in as_completed(futures):
                 algo_results.append(future.result())
                 done_count += 1
-                jobs[job_id]["progress"] = 10 + int((done_count / 3) * 50)  # 10 → 60
+                jobs[job_id]["progress"] = 10 + int((done_count / len(algos)) * 85)
 
-        # Sort results in fixed display order
+        # Sort in the canonical display order
         order = {a: i for i, a in enumerate(PYNGUIN_ALGORITHMS)}
         algo_results.sort(key=lambda r: order.get(r["algorithm"], 99))
 
         jobs[job_id]["algo_results"] = algo_results
-        jobs[job_id]["progress"]     = 60
+        jobs[job_id]["progress"]     = 95
 
-        # ── Phase 2: Refine with DeepSeek ────────────────────────────────
-        jobs[job_id]["phase"]       = "refining"
-        jobs[job_id]["phase_label"] = "Refining tests with DeepSeek…"
-
-        refinement = _refine_tests_with_deepseek(
-            algo_results=algo_results,
-            source_code=code,
-            module_name=module_name,
-            ollama_url=ollama_url,
-            model=model,
-            timeout=timeout,
-        )
-        jobs[job_id]["progress"]   = 90
-        jobs[job_id]["refinement"] = refinement
-
-        # ── Save outputs ──────────────────────────────────────────────────
+        # Save per-algo test files and bundle ZIP
         saved_files = []
-
-        # Save per-algo raw test files
         for r in algo_results:
             if r["status"] == "success" and r["test_code"]:
                 fname    = f"test_{module_name}_{r['algorithm'].lower()}.py"
@@ -1353,16 +1426,6 @@ def process_single_file_pynguin(
                 r["saved_path"] = out_path
                 saved_files.append((out_path, fname))
 
-        # Save refined test file
-        if refinement["status"] == "success" and refinement["refined_code"]:
-            refined_fname    = f"test_{module_name}_refined.py"
-            refined_out_path = os.path.join(TESTS_FOLDER, refined_fname)
-            with open(refined_out_path, "w") as f:
-                f.write(refinement["refined_code"])
-            refinement["saved_path"] = refined_out_path
-            saved_files.append((refined_out_path, refined_fname))
-
-        # Bundle ZIP
         results_zip = os.path.join(UPLOAD_FOLDER, f"tests_{job_id}.zip")
         with zipfile.ZipFile(results_zip, "w") as zout:
             for abs_path, arc_name in saved_files:
@@ -1375,19 +1438,16 @@ def process_single_file_pynguin(
         jobs[job_id]["phase"]        = "done"
         jobs[job_id]["phase_label"]  = "Complete"
 
-        # Summary stats for the status response
         successful_algos = [r for r in algo_results if r["status"] == "success"]
         jobs[job_id]["message"] = (
-            f"{len(successful_algos)}/{len(PYNGUIN_ALGORITHMS)} algorithms succeeded. "
-            + ("Refined." if refinement["status"] == "success" else "Refinement failed.")
+            f"{len(successful_algos)}/{len(algos)} algorithm(s) succeeded."
         )
 
-        # Flatten into a results list the frontend expects
-        # Each algo is one row; refinement is a separate key
         jobs[job_id]["results"] = [
             {
                 "file":           f"test_{module_name}_{r['algorithm'].lower()}.py",
                 "algorithm":      r["algorithm"],
+                "model":          None,
                 "status":         r["status"],
                 "content":        r["test_code"],
                 "num_tests":      r["num_tests"],
@@ -1400,6 +1460,308 @@ def process_single_file_pynguin(
                 },
             }
             for r in algo_results
+        ]
+
+    except Exception as e:
+        jobs[job_id]["status"] = "error"
+        jobs[job_id]["error"]  = str(e)
+        print(traceback.format_exc())
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ★  Single-file: LLM-only worker
+#    Runs selected LLM models sequentially, computes coverage + mutation each.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _run_llm_model_for_tests(
+    model: str,
+    code: str,
+    module_name: str,
+    src_path: str,
+    ollama_url: str,
+    timeout: int,
+) -> dict:
+    """
+    Generate tests with one LLM model and compute coverage + mutation score.
+    Returns a result dict in the same shape as a pynguin algo result.
+    """
+    result: Dict[str, Any] = {
+        "model":          model,
+        "algorithm":      None,
+        "status":         "pending",
+        "test_code":      None,
+        "coverage":       0.0,
+        "mutation_score": 0.0,
+        "num_tests":      0,
+        "error":          None,
+    }
+
+    try:
+        raw_tests = generate_tests_ollama(
+            code=code, module_name=module_name,
+            ollama_url=ollama_url, model=model, timeout=timeout,
+        )
+
+        if not raw_tests or not raw_tests.strip():
+            raw_tests = fallback_simple_tests(code, module_name)
+            result["error"] = "LLM returned empty output — using fallback"
+
+        try:
+            ast.parse(raw_tests)
+        except SyntaxError:
+            raw_tests = _clean_code(raw_tests)
+            try:
+                ast.parse(raw_tests)
+            except SyntaxError:
+                raw_tests = fallback_simple_tests(code, module_name)
+                result["error"] = "LLM output had syntax errors — using fallback"
+
+        result["test_code"] = raw_tests
+        result["num_tests"] = raw_tests.count("def test_")
+        result["status"]    = "success"
+
+        # ── Compute coverage + mutation in an isolated temp dir ───────────
+        mdir = tempfile.mkdtemp(prefix=f"codexter_llm_")
+        try:
+            shutil.copy(src_path, os.path.join(mdir, f"{module_name}.py"))
+            open(os.path.join(mdir, "__init__.py"), "w").close()
+            safe_model = re.sub(r"[^a-z0-9]", "_", model.lower())
+            test_fname = f"test_{module_name}_{safe_model}.py"
+            test_dest  = os.path.join(mdir, test_fname)
+            with open(test_dest, "w") as f:
+                f.write(raw_tests)
+
+            cov, _ = calculate_coverage(
+                os.path.join(mdir, f"{module_name}.py"), test_dest, mdir)
+            mut, _ = calculate_mutation_score(module_name, test_dest, mdir)
+            result["coverage"]       = cov
+            result["mutation_score"] = mut
+        finally:
+            shutil.rmtree(mdir, ignore_errors=True)
+
+    except Exception as e:
+        result["status"] = "error"
+        result["error"]  = str(e)
+
+    return result
+
+
+def process_single_file_llm(
+    job_id: str,
+    code: str,
+    module_name: str,
+    file_path: str,
+    ollama_url: str,
+    timeout: int,
+    selected_models: Optional[List[str]] = None,
+):
+    """
+    LLM-only approach: runs each selected model sequentially,
+    computes coverage + mutation for each, returns per-model results.
+    """
+    models = [m for m in LLM_TEST_MODELS if m in (selected_models or LLM_TEST_MODELS)]
+    if not models:
+        models = ["deepseek-coder:1.3b"]
+
+    jobs[job_id]["status"]   = "processing"
+    jobs[job_id]["progress"] = 0
+    jobs[job_id]["phase"]    = "llm"
+
+    work_dir = tempfile.mkdtemp(prefix="codexter_llm_single_")
+    try:
+        src_path = os.path.join(work_dir, f"{module_name}.py")
+        with open(src_path, "w") as f:
+            f.write(code)
+        open(os.path.join(work_dir, "__init__.py"), "w").close()
+
+        model_results: List[dict] = []
+
+        for idx, model in enumerate(models):
+            jobs[job_id]["phase_label"] = f"Running {model} ({idx+1}/{len(models)})…"
+            jobs[job_id]["progress"]    = 5 + int(idx / len(models) * 85)
+
+            r = _run_llm_model_for_tests(
+                model=model, code=code, module_name=module_name,
+                src_path=src_path, ollama_url=ollama_url, timeout=timeout,
+            )
+            model_results.append(r)
+            jobs[job_id]["progress"] = 5 + int((idx + 1) / len(models) * 85)
+
+        # Save files and bundle ZIP
+        saved_files = []
+        for r in model_results:
+            if r["status"] == "success" and r["test_code"]:
+                safe_model = re.sub(r"[^a-z0-9]", "_", r["model"].lower())
+                fname    = f"test_{module_name}_{safe_model}.py"
+                out_path = os.path.join(TESTS_FOLDER, fname)
+                with open(out_path, "w") as f:
+                    f.write(r["test_code"])
+                r["saved_path"] = out_path
+                saved_files.append((out_path, fname))
+
+        results_zip = os.path.join(UPLOAD_FOLDER, f"tests_{job_id}.zip")
+        with zipfile.ZipFile(results_zip, "w") as zout:
+            for abs_path, arc_name in saved_files:
+                if os.path.exists(abs_path):
+                    zout.write(abs_path, arc_name)
+
+        jobs[job_id]["download_url"] = f"/download_tests/{job_id}"
+        jobs[job_id]["progress"]     = 100
+        jobs[job_id]["status"]       = "completed"
+        jobs[job_id]["phase"]        = "done"
+        jobs[job_id]["phase_label"]  = "Complete"
+
+        ok = [r for r in model_results if r["status"] == "success"]
+        jobs[job_id]["message"] = f"{len(ok)}/{len(models)} model(s) succeeded."
+
+        jobs[job_id]["results"] = [
+            {
+                "file":           f"test_{module_name}_{re.sub(r'[^a-z0-9]','_',r['model'].lower())}.py",
+                "algorithm":      None,
+                "model":          r["model"],
+                "status":         r["status"],
+                "content":        r["test_code"],
+                "num_tests":      r["num_tests"],
+                "coverage":       r["coverage"],
+                "mutation_score": r["mutation_score"],
+                "error":          r["error"],
+                "metrics": {
+                    "coverage_percent": round(r["coverage"] * 100, 2),
+                    "mutation_score":   round(r["mutation_score"], 4),
+                },
+            }
+            for r in model_results
+        ]
+
+    except Exception as e:
+        jobs[job_id]["status"] = "error"
+        jobs[job_id]["error"]  = str(e)
+        print(traceback.format_exc())
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ★  Single-file: Hybrid worker  (one algo → mutation filter → one LLM refiner)
+#    Functionally identical to the old process_single_file_pynguin but:
+#      • runs only the one user-selected algorithm
+#      • uses the user-selected LLM model for refinement
+# ══════════════════════════════════════════════════════════════════════════════
+
+def process_single_file_hybrid(
+    job_id: str,
+    code: str,
+    module_name: str,
+    file_path: str,
+    ollama_url: str,
+    model: str,
+    timeout: int,
+    hybrid_algo: str = "RANDOM",
+    hybrid_llm: str = "deepseek-coder:1.3b",
+):
+    """
+    Hybrid approach:
+      1. Run one Pynguin algorithm
+      2. Calculate coverage + mutation
+      3. Refine with one LLM
+    Returns results[] (the algo result) + refinement (the LLM-refined output).
+    """
+    # Validate algo choice
+    if hybrid_algo not in PYNGUIN_ALGORITHMS:
+        hybrid_algo = "RANDOM"
+
+    jobs[job_id]["status"]   = "processing"
+    jobs[job_id]["progress"] = 0
+    jobs[job_id]["phase"]    = "pynguin"
+
+    work_dir = tempfile.mkdtemp(prefix="codexter_hybrid_")
+    try:
+        src_path = os.path.join(work_dir, f"{module_name}.py")
+        with open(src_path, "w") as f:
+            f.write(code)
+        open(os.path.join(work_dir, "__init__.py"), "w").close()
+
+        # ── Phase 1: Pynguin ─────────────────────────────────────────────
+        jobs[job_id]["phase_label"] = f"Running Pynguin/{hybrid_algo}…"
+        jobs[job_id]["progress"]    = 10
+
+        algo_result = _run_pynguin_algorithm(
+            algorithm=hybrid_algo, module_name=module_name,
+            src_path=src_path, work_dir=work_dir, timeout=timeout,
+            source_code=code,
+        )
+
+        jobs[job_id]["algo_results"] = [algo_result]
+        jobs[job_id]["progress"]     = 60
+
+        # ── Phase 2: LLM refinement ───────────────────────────────────────
+        jobs[job_id]["phase"]       = "refining"
+        jobs[job_id]["phase_label"] = f"Refining with {hybrid_llm}…"
+
+        refinement = _refine_tests_with_llm(
+            algo_results=[algo_result],
+            source_code=code,
+            module_name=module_name,
+            ollama_url=ollama_url,
+            model=hybrid_llm,
+            timeout=timeout,
+        )
+        jobs[job_id]["progress"]   = 90
+        jobs[job_id]["refinement"] = refinement
+
+        # ── Save files ────────────────────────────────────────────────────
+        saved_files = []
+
+        if algo_result["status"] == "success" and algo_result["test_code"]:
+            fname    = f"test_{module_name}_{hybrid_algo.lower()}_raw.py"
+            out_path = os.path.join(TESTS_FOLDER, fname)
+            with open(out_path, "w") as f:
+                f.write(algo_result["test_code"])
+            algo_result["saved_path"] = out_path
+            saved_files.append((out_path, fname))
+
+        if refinement["status"] == "success" and refinement["refined_code"]:
+            refined_fname    = f"test_{module_name}_{hybrid_algo.lower()}_refined.py"
+            refined_out_path = os.path.join(TESTS_FOLDER, refined_fname)
+            with open(refined_out_path, "w") as f:
+                f.write(refinement["refined_code"])
+            refinement["saved_path"] = refined_out_path
+            saved_files.append((refined_out_path, refined_fname))
+
+        results_zip = os.path.join(UPLOAD_FOLDER, f"tests_{job_id}.zip")
+        with zipfile.ZipFile(results_zip, "w") as zout:
+            for abs_path, arc_name in saved_files:
+                if os.path.exists(abs_path):
+                    zout.write(abs_path, arc_name)
+
+        jobs[job_id]["download_url"] = f"/download_tests/{job_id}"
+        jobs[job_id]["progress"]     = 100
+        jobs[job_id]["status"]       = "completed"
+        jobs[job_id]["phase"]        = "done"
+        jobs[job_id]["phase_label"]  = "Complete"
+        jobs[job_id]["message"] = (
+            f"Hybrid: {hybrid_algo} algo + {hybrid_llm} refinement. "
+            + ("Refined." if refinement["status"] == "success" else "Refinement failed.")
+        )
+
+        jobs[job_id]["results"] = [
+            {
+                "file":           f"test_{module_name}_{hybrid_algo.lower()}_raw.py",
+                "algorithm":      algo_result["algorithm"],
+                "model":          None,
+                "status":         algo_result["status"],
+                "content":        algo_result["test_code"],
+                "num_tests":      algo_result["num_tests"],
+                "coverage":       algo_result["coverage"],
+                "mutation_score": algo_result["mutation_score"],
+                "error":          algo_result["error"],
+                "metrics": {
+                    "coverage_percent": round(algo_result["coverage"] * 100, 2),
+                    "mutation_score":   round(algo_result["mutation_score"], 4),
+                },
+            }
         ]
 
     except Exception as e:
@@ -1451,7 +1813,7 @@ def _process_one_file(
     job_id, code, module_name, file_path, ollama_url, model, timeout,
     context="", strategy="auto", force_ensemble=False,
 ) -> dict:
-    """Used by ZIP/codebase pipeline only."""
+    """Used by ZIP/codebase pipeline only — unchanged."""
     jobs[job_id]["current_file"] = f"{module_name}.py"
     work_dir = tempfile.mkdtemp(prefix="codexter_")
     entry: Dict[str, Any] = {"file": f"{module_name}.py", "status": "pending"}
@@ -1630,9 +1992,8 @@ def process_zip_job(job_id, zip_path, extract_path, model, ollama_url, timeout, 
         print(traceback.format_exc())
 
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-# Code Quality Metrics  (used by refactor pipelines)
+# Code Quality Metrics  (used by refactor pipelines) — unchanged
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _pep8_count(code: str) -> int:
@@ -1715,7 +2076,6 @@ def compute_code_metrics(code: str) -> dict:
 
 
 def metrics_delta(before: dict, after: dict) -> dict:
-    """Positive delta = improvement (reduction in a bad metric)."""
     return {
         "loc_delta":        before["loc"]        - after["loc"],
         "cyclomatic_delta": before["cyclomatic"] - after["cyclomatic"],
@@ -1736,7 +2096,6 @@ def unified_diff_str(original: str, refactored: str, filename: str = "code.py") 
 
 
 def compute_reward(before: dict, after: dict) -> float:
-    """Reward in [-1, 1]. Positive = better code."""
     total = 0.0
     for key, weight in REWARD_WEIGHTS.items():
         bv = before[key]; av = after[key]
@@ -1750,7 +2109,7 @@ def compute_reward(before: dict, after: dict) -> float:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ★  Multi-model refactor pipeline
+# Multi-model refactor pipeline — unchanged
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _refactor_one_model(
@@ -1764,6 +2123,32 @@ def _refactor_one_model(
         "reward": None, "diff": None, "error": None, "elapsed": 0.0,
     }
     t0 = time.time()
+
+    try:
+        r = requests.get(f"{ollama_url}/api/tags", timeout=5)
+        if r.status_code == 200:
+            available = [m["name"] for m in r.json().get("models", [])]
+            if not any(model == m or m.startswith(model.split(":")[0]) for m in available):
+                result["status"] = "error"
+                result["error"] = f"Model '{model}' not found in Ollama. Run: ollama pull {model}"
+                result["elapsed"] = round(time.time() - t0, 2)
+                return result
+    except requests.exceptions.Timeout:
+        result["status"] = "error"
+        result["error"] = f"Cannot reach Ollama (tags check timed out)"
+        result["elapsed"] = round(time.time() - t0, 2)
+        return result
+    except requests.exceptions.ConnectionError:
+        result["status"] = "error"
+        result["error"] = f"Cannot connect to Ollama at {ollama_url}"
+        result["elapsed"] = round(time.time() - t0, 2)
+        return result
+    except Exception as e:
+        result["status"] = "error"
+        result["error"] = f"Availability check failed: {type(e).__name__}: {e}"
+        result["elapsed"] = round(time.time() - t0, 2)
+        return result
+
     try:
         refactored, summary = refactor_code_ollama(
             code=code, module_name=module_name,
@@ -1781,10 +2166,19 @@ def _refactor_one_model(
             "diff":            unified_diff_str(code, refactored, f"{module_name}.py"),
             "elapsed":         elapsed,
         })
+    except requests.exceptions.Timeout:
+        result["status"] = "error"
+        result["error"]  = f"Model '{model}' timed out after {timeout}s"
+        result["elapsed"] = round(time.time() - t0, 2)
+    except requests.exceptions.ConnectionError:
+        result["status"] = "error"
+        result["error"]  = f"Lost connection to Ollama during generation"
+        result["elapsed"] = round(time.time() - t0, 2)
     except Exception as e:
         result["status"]  = "error"
-        result["error"]   = str(e)
+        result["error"]   = f"{type(e).__name__}: {e}"
         result["elapsed"] = round(time.time() - t0, 2)
+
     return result
 
 
@@ -1794,33 +2188,40 @@ def process_multimodel_refactor(
 ):
     jobs[job_id].update({
         "status": "processing", "progress": 0,
-        "phase": "running", "phase_label": "Running 3 models in parallel…",
+        "phase": "running", "phase_label": "Running models one at a time…",
     })
     before = compute_code_metrics(code)
     jobs[job_id]["before_metrics"] = before
     model_results: List[dict] = []
 
-    def _run(m):
-        return _refactor_one_model(code, module_name, m, ollama_url, timeout, before)
-
     try:
-        with ThreadPoolExecutor(max_workers=3) as ex:
-            futures = {ex.submit(_run, m): m for m in REFACTOR_MODELS}
-            done = 0
-            for f in as_completed(futures):
-                model_results.append(f.result())
-                done += 1
-                jobs[job_id]["progress"] = int(done / 3 * 100)
-                jobs[job_id]["partial_results"] = model_results[:]
+        for i, model in enumerate(REFACTOR_MODELS):
+            jobs[job_id]["phase_label"] = f"Running {model} ({i+1}/{len(REFACTOR_MODELS)})…"
+            jobs[job_id]["progress"] = int(i / len(REFACTOR_MODELS) * 100)
+
+            try:
+                requests.post(
+                    f"{ollama_url}/api/generate",
+                    json={"model": model, "prompt": "hi", "stream": False,
+                          "options": {"num_predict": 1}},
+                    timeout=120,
+                )
+            except Exception:
+                pass
+
+            result = _refactor_one_model(code, module_name, model, ollama_url, timeout, before)
+            model_results.append(result)
+            jobs[job_id]["progress"] = int((i + 1) / len(REFACTOR_MODELS) * 100)
+            jobs[job_id]["partial_results"] = model_results[:]
 
         model_results.sort(key=lambda r: r.get("reward") or -99, reverse=True)
         best = model_results[0]["model"] if model_results else None
         jobs[job_id].update({
-            "status":       "completed", "progress": 100,
-            "phase":        "done",      "phase_label": "Complete",
-            "results":      model_results,
-            "best_model":   best,
-            "message":      f"3 models complete. Best: {best}",
+            "status":     "completed", "progress": 100,
+            "phase":      "done",      "phase_label": "Complete",
+            "results":    model_results,
+            "best_model": best,
+            "message":    f"3 models complete. Best: {best}",
         })
     except Exception as e:
         jobs[job_id]["status"] = "error"
@@ -1829,7 +2230,7 @@ def process_multimodel_refactor(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ★  Simulated-PPO refactor pipeline
+# Simulated-PPO refactor pipeline — unchanged
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _ppo_feedback_prompt(
@@ -1899,7 +2300,7 @@ def process_ppo_refactor(
 ):
     jobs[job_id].update({
         "status": "processing", "progress": 0,
-        "phase": "ppo", "phase_label": "Initialising PPO loop…",
+        "phase": "ppo", "phase_label": "Starting iterative refactor loop…",
         "iterations": [],
     })
     before      = compute_code_metrics(code)
@@ -1909,7 +2310,6 @@ def process_ppo_refactor(
     log: List[dict] = []
     jobs[job_id]["before_metrics"] = before
 
-    # initialise so loop body can reference these on iteration 2+
     reward = 0.0
     delta  = {k: 0 for k in ("cyclomatic_delta", "pep8_delta", "halstead_delta", "loc_delta")}
 
@@ -1996,18 +2396,53 @@ def process_ppo_refactor(
 
 @app.post("/generate-tests")
 async def generate_tests_endpoint(req: SingleFileRequest):
-    """Single-file test generation via Pynguin + DeepSeek refinement."""
+    """
+    Single-file test generation.
+    Routes to the correct worker based on req.approach:
+      • "pynguin"  → run selected Pynguin algorithms only
+      • "llm"      → run selected LLM models only
+      • "hybrid"   → run one Pynguin algo + one LLM refiner (default)
+    """
     job_id = str(uuid.uuid4())
     jobs[job_id] = {
         "status": "queued", "submitted_at": time.time(),
         "filename": f"{req.module_name}.py", "scope": "single",
+        "approach": req.approach,
     }
-    threading.Thread(
-        target=process_single_file_pynguin,
-        args=(job_id, req.code, req.module_name, req.file_path,
-              req.ollama_url, req.ollama_model, req.ollama_timeout),
-        daemon=True,
-    ).start()
+
+    if req.approach == "pynguin":
+        threading.Thread(
+            target=process_single_file_pynguin,
+            args=(
+                job_id, req.code, req.module_name, req.file_path,
+                req.ollama_url, req.ollama_model, req.ollama_timeout,
+                req.selected_algos,
+            ),
+            daemon=True,
+        ).start()
+
+    elif req.approach == "llm":
+        threading.Thread(
+            target=process_single_file_llm,
+            args=(
+                job_id, req.code, req.module_name, req.file_path,
+                req.ollama_url, req.ollama_timeout,
+                req.selected_models,
+            ),
+            daemon=True,
+        ).start()
+
+    else:  # "hybrid" (default)
+        threading.Thread(
+            target=process_single_file_hybrid,
+            args=(
+                job_id, req.code, req.module_name, req.file_path,
+                req.ollama_url, req.ollama_model, req.ollama_timeout,
+                req.hybrid_algo, req.hybrid_llm,
+            ),
+            daemon=True,
+        ).start()
+
     return {"message": "Job submitted", "job_id": job_id, "scope": "single"}
 
 
@@ -2028,11 +2463,8 @@ async def generate_tests_multiple_endpoint(req: MultipleFileRequest):
     return {"message": "Job submitted", "job_id": job_id, "scope": "multiple"}
 
 
-
 @app.post("/refactor-multimodel")
 async def refactor_multimodel_endpoint(req: RefactorRequest):
-    """Refactor using deepseek-coder, starcoder, and codellama in parallel.
-    Returns per-model metrics (cyclomatic, PEP8, Halstead, LOC delta) + diffs."""
     job_id = str(uuid.uuid4())
     jobs[job_id] = {
         "status": "queued", "submitted_at": time.time(),
@@ -2048,8 +2480,6 @@ async def refactor_multimodel_endpoint(req: RefactorRequest):
 
 @app.post("/refactor-ppo")
 async def refactor_ppo_endpoint(req: RefactorRequest):
-    """Simulated-PPO iterative refactor: score output → feed back → re-generate.
-    Runs up to 5 iterations; stops early when reward >= 0.6."""
     job_id = str(uuid.uuid4())
     jobs[job_id] = {
         "status": "queued", "submitted_at": time.time(),
@@ -2200,6 +2630,23 @@ async def ollama_status(ollama_url: str = "http://localhost:11434"):
         return {"status": "error", "message": "Unexpected response"}
     except Exception as e:
         return {"status": "disconnected", "error": str(e)}
+
+
+@app.get("/check-models")
+async def check_models(ollama_url: str = "http://localhost:11434"):
+    """Returns which refactor models are available in Ollama."""
+    try:
+        r = requests.get(f"{ollama_url}/api/tags", timeout=5)
+        available = [m["name"] for m in r.json().get("models", [])]
+        status = {}
+        for model in REFACTOR_MODELS:
+            status[model] = any(
+                model == m or m.startswith(model.split(":")[0])
+                for m in available
+            )
+        return {"models": status, "available": available}
+    except Exception as e:
+        return {"error": str(e), "models": {m: False for m in REFACTOR_MODELS}}
 
 
 if __name__ == "__main__":
