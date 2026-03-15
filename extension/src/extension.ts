@@ -99,6 +99,15 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
         case "checkBackend":
           await this.checkBackend();
           break;
+        case "refactorAst":
+          await this.handleRefactorAst(msg.filePath);
+          break;
+        case "refactorSa":
+          await this.handleRefactorSa(msg.filePath, msg.model);
+          break;
+        case "refactorRag":
+          await this.handleRefactorRag(msg.filePath, msg.model);
+          break;
         case "refactorSingleModel":
           await this.handleRefactorSingleModel(msg.filePath, msg.model);
           break;
@@ -187,7 +196,6 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
           module_name: moduleName,
           directory: dirPath,
           file_path: filePath,
-          // Approach routing — snake_case to match backend Pydantic model
           approach,
           selected_algos: selectedAlgos,
           selected_models: selectedModels,
@@ -379,7 +387,104 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  // ── Refactor: Multi-model job ───────────────────────────────────────────────
+  // ── Refactor: AST Rule-Engine job ──────────────────────────────────────────
+  private async handleRefactorAst(filePath: string) {
+    try {
+      const moduleName = path.basename(filePath, ".py");
+      const code = Buffer.from(
+        await vscode.workspace.fs.readFile(vscode.Uri.file(filePath)),
+      ).toString("utf8");
+
+      const { data } = await axios.post(
+        `${BACKEND_URL}/refactor-ast`,
+        {
+          code,
+          module_name: moduleName,
+          file_path: filePath,
+          ollama_url: "http://localhost:11434",
+          ollama_timeout: 60,
+        },
+        { timeout: 30000 },
+      );
+
+      this._view?.webview.postMessage({
+        type: "astJobStarted",
+        jobId: data.job_id,
+      });
+    } catch (err) {
+      this._view?.webview.postMessage({
+        type: "astJobError",
+        error: this.extractError(err),
+      });
+    }
+  }
+
+  // ── Refactor: Simulated Annealing job ───────────────────────────────────────
+  private async handleRefactorSa(filePath: string, model: string) {
+    try {
+      const moduleName = path.basename(filePath, ".py");
+      const code = Buffer.from(
+        await vscode.workspace.fs.readFile(vscode.Uri.file(filePath)),
+      ).toString("utf8");
+
+      const { data } = await axios.post(
+        `${BACKEND_URL}/refactor-sa`,
+        {
+          code,
+          module_name: moduleName,
+          file_path: filePath,
+          ollama_model: model,
+          ollama_url: "http://localhost:11434",
+          ollama_timeout: 300,
+        },
+        { timeout: 30000 },
+      );
+
+      this._view?.webview.postMessage({
+        type: "saJobStarted",
+        jobId: data.job_id,
+      });
+    } catch (err) {
+      this._view?.webview.postMessage({
+        type: "saJobError",
+        error: this.extractError(err),
+      });
+    }
+  }
+
+  // ── Refactor: RAG job ────────────────────────────────────────────────────────
+  private async handleRefactorRag(filePath: string, model: string) {
+    try {
+      const moduleName = path.basename(filePath, ".py");
+      const code = Buffer.from(
+        await vscode.workspace.fs.readFile(vscode.Uri.file(filePath)),
+      ).toString("utf8");
+
+      const { data } = await axios.post(
+        `${BACKEND_URL}/refactor-rag`,
+        {
+          code,
+          module_name: moduleName,
+          file_path: filePath,
+          ollama_model: model,
+          ollama_url: "http://localhost:11434",
+          ollama_timeout: 300,
+        },
+        { timeout: 30000 },
+      );
+
+      this._view?.webview.postMessage({
+        type: "ragJobStarted",
+        jobId: data.job_id,
+      });
+    } catch (err) {
+      this._view?.webview.postMessage({
+        type: "ragJobError",
+        error: this.extractError(err),
+      });
+    }
+  }
+
   private async handleRefactorMultiModel(filePath: string) {
     try {
       const moduleName = path.basename(filePath, ".py");
@@ -528,6 +633,35 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
   --r:7px;--ease:cubic-bezier(.4,0,.2,1);
 }
 
+/* ── Light mode overrides ── */
+body.light{
+  --bg:#f4f4f8;--surf:#ffffff;--surf2:#ebebf0;--bd:#d4d4e4;--bd2:#c4c4d8;
+  --accent:#5b4de0;--accent2:#6f5ef5;--aclo:rgba(91,77,224,0.08);--acbd:rgba(91,77,224,0.22);
+  --green:#16a34a;--greenlo:rgba(22,163,74,0.08);--greenbd:rgba(22,163,74,0.20);
+  --amber:#b45309;--amberlo:rgba(180,83,9,0.08);--amberbd:rgba(180,83,9,0.22);
+  --red:#dc2626;--redlo:rgba(220,38,38,0.08);--redbd:rgba(220,38,38,0.20);
+  --teal:#0e7490;--teallo:rgba(14,116,144,0.08);--tealbd:rgba(14,116,144,0.20);
+  --text:#1a1a2e;--muted:#5a5a7a;--muted2:#9090aa;
+}
+body.light .btn-violet{background:linear-gradient(135deg,#5b4de0,#7c6ef5);color:#fff;box-shadow:0 3px 14px rgba(91,77,224,.20);}
+body.light .btn-violet:hover:not(:disabled){box-shadow:0 5px 20px rgba(91,77,224,.34);}
+body.light .btn-green{background:linear-gradient(135deg,#15803d,#16a34a);color:#fff;box-shadow:0 3px 14px rgba(22,163,74,.18);}
+body.light .btn-green:hover:not(:disabled){box-shadow:0 5px 20px rgba(22,163,74,.30);}
+body.light .btn-amber{background:linear-gradient(135deg,#92400e,#b45309);color:#fff;box-shadow:0 3px 14px rgba(180,83,9,.18);}
+body.light .btn-amber:hover:not(:disabled){box-shadow:0 5px 20px rgba(180,83,9,.30);}
+body.light .btn-teal{background:linear-gradient(135deg,#0c4a6e,#0e7490);color:#fff;box-shadow:0 3px 14px rgba(14,116,144,.18);}
+body.light .btn-teal:hover:not(:disabled){box-shadow:0 5px 20px rgba(14,116,144,.30);}
+body.light .tfc-pre{color:#2a2a4a;}
+body.light .ref-code-pre{color:#2a2a4a;}
+body.light .pulse-dot{box-shadow:0 0 7px var(--accent);}
+body.light ::-webkit-scrollbar-thumb{background:var(--bd2);}
+body.light .score-g{color:#16a34a;}
+body.light .score-a{color:#b45309;}
+body.light .score-r{color:#dc2626;}
+body.light .delta-pos{color:#15803d;}
+body.light .delta-neg{color:#dc2626;}
+body.light .delta-neu{color:#b45309;}
+
 html,body{background:var(--bg);color:var(--text);font-family:var(--mono);
   font-size:11.5px;line-height:1.5;overflow-x:hidden;overflow-y:auto;min-height:100vh;}
 
@@ -537,6 +671,18 @@ html,body{background:var(--bg);color:var(--text);font-family:var(--mono);
 .pulse-dot{width:7px;height:7px;border-radius:50%;background:var(--accent);
   box-shadow:0 0 9px var(--accent);animation:pulse 2.6s ease-in-out infinite;flex-shrink:0;}
 .tagline{font-size:9.5px;color:var(--muted);margin-top:3px;letter-spacing:.09em;text-transform:uppercase;}
+
+/* ── Theme toggle button ── */
+.theme-toggle{
+  margin-left:auto;background:transparent;border:1px solid var(--bd);
+  border-radius:5px;color:var(--muted);font-size:12px;cursor:pointer;
+  padding:2px 7px;line-height:1.5;font-family:var(--sans);
+  transition:color .14s,border-color .14s,background .14s;
+  display:flex;align-items:center;gap:4px;flex-shrink:0;
+}
+.theme-toggle:hover{color:var(--text);border-color:var(--accent);background:var(--aclo);}
+.theme-toggle-icon{font-size:11px;line-height:1;}
+.theme-toggle-label{font-size:9px;letter-spacing:.06em;text-transform:uppercase;}
 
 .conn-bar{display:flex;align-items:center;gap:6px;margin:10px 15px 0;padding:7px 10px;
   background:var(--surf);border:1px solid var(--bd);border-radius:var(--r);
@@ -563,6 +709,8 @@ html,body{background:var(--bg);color:var(--text);font-family:var(--mono);
 .otab:hover:not(.on){background:rgba(255,255,255,.04);color:var(--text)}
 .otab.on{background:var(--aclo);color:var(--accent2);border:1px solid var(--acbd);}
 
+body.light .otab:hover:not(.on){background:rgba(0,0,0,.04);}
+
 .mpanel{display:none;padding:14px 15px 0}
 .mpanel.on{display:block;animation:fup .22s var(--ease) forwards}
 
@@ -574,6 +722,9 @@ html,body{background:var(--bg);color:var(--text);font-family:var(--mono);
 .itab:hover:not(.on){background:rgba(255,255,255,.04);color:var(--text)}
 .itab.on{background:rgba(255,255,255,.06);color:var(--text);border:1px solid var(--bd2);
   box-shadow:inset 0 1px 0 rgba(255,255,255,.04);}
+
+body.light .itab:hover:not(.on){background:rgba(0,0,0,.04);}
+body.light .itab.on{background:rgba(0,0,0,.05);box-shadow:none;}
 
 .spanel{display:none}
 .spanel.on{display:block;animation:fup .2s var(--ease) forwards;padding-bottom:24px}
@@ -683,6 +834,10 @@ html,body{background:var(--bg);color:var(--text);font-family:var(--mono);
 .sel-label{font-size:10.5px;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .sel-meta{font-size:9px;color:var(--muted);white-space:nowrap;}
 
+body.light .sel-row:hover{background:rgba(0,0,0,.03);}
+body.light .sel-badge.ds{background:#ede9ff;border-color:#7c3aed;color:#5b21b6;}
+body.light .sel-badge.cl{background:#fef3c7;border-color:#b45309;color:#92400e;}
+
 /* ── Results / metrics table ── */
 .section-hdr{font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);
   margin-bottom:8px;display:flex;align-items:center;gap:6px;}
@@ -695,11 +850,8 @@ html,body{background:var(--bg);color:var(--text);font-family:var(--mono);
 .gt-cell{padding:7px 10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .gt-cell.right{text-align:right;}
 
-/* Pynguin table: Key | Coverage% | Mutation% | Status  (4 cols) */
 .gt-row.pynguin-row{grid-template-columns:100px 1fr 70px 70px 60px;}
-/* LLM table: Key | Coverage% | Mutation% | Status  (4 cols) */
 .gt-row.llm-row{grid-template-columns:1fr 70px 70px 60px;}
-/* Hybrid table: single row — Algorithm | LLM | Coverage% | Mutation% | Status */
 .gt-row.hybrid-row{grid-template-columns:90px 1fr 70px 70px 60px;}
 
 .algo-badge{display:inline-flex;align-items:center;padding:2px 7px;border-radius:4px;font-size:8.5px;letter-spacing:.05em;font-weight:600;}
@@ -715,6 +867,9 @@ html,body{background:var(--bg);color:var(--text);font-family:var(--mono);
 .tag.err{background:var(--redlo);color:var(--red);border:1px solid var(--redbd)}
 .tag.run{background:var(--aclo);color:var(--accent2);border:1px solid var(--acbd)}
 .tag.skip{background:var(--surf2);color:var(--muted);border:1px solid var(--bd2)}
+
+body.light .model-badge.ds{background:#ede9ff;border-color:#7c3aed;color:#5b21b6;}
+body.light .model-badge.cl{background:#fef3c7;border-color:#b45309;color:#92400e;}
 
 /* ── Generated test file cards ── */
 .test-files-section{display:none;margin-top:14px;}
@@ -763,6 +918,8 @@ html,body{background:var(--bg);color:var(--text);font-family:var(--mono);
 .mode-desc{font-size:9px;color:var(--muted);margin-bottom:10px;padding:6px 9px;background:var(--surf2);border:1px solid var(--bd);border-radius:5px;line-height:1.6;}
 .mode-desc .hi{color:var(--text)}
 
+body.light .mtog:hover:not(.on){background:rgba(0,0,0,.04);}
+
 /* ── Shared refactor styles ── */
 .ref-file-card{background:var(--surf2);border:1px solid var(--bd);border-radius:var(--r);
   padding:11px 13px;margin-bottom:13px;display:flex;align-items:flex-start;gap:9px;}
@@ -782,6 +939,8 @@ html,body{background:var(--bg);color:var(--text);font-family:var(--mono);
 .mm-mrow.best-row{background:#0d1f10;}
 .mm-mrow.loading-row{opacity:.6;}
 
+body.light .mm-mrow.best-row{background:#dcfce7;}
+
 /* ── PPO metrics table ── */
 .ppo-mtable{background:var(--surf);border:1px solid var(--bd);border-radius:var(--r);overflow:hidden;}
 .ppo-mhdr{display:grid;grid-template-columns:1fr 46px 46px 46px 46px 56px;gap:4px;
@@ -792,6 +951,8 @@ html,body{background:var(--bg);color:var(--text);font-family:var(--mono);
 .ppo-mrow:last-child{border-bottom:none}
 .ppo-mrow.best-row{background:#0d1f10;}
 .ppo-mrow.loading-row{opacity:.6;}
+
+body.light .ppo-mrow.best-row{background:#dcfce7;}
 
 .delta-pos{color:#4ade80;}.delta-neg{color:#f87171;}.delta-neu{color:#fbbf24;}.delta-dim{color:var(--muted)}
 .reward-cell{display:flex;align-items:center;gap:4px;}
@@ -812,6 +973,11 @@ html,body{background:var(--bg);color:var(--text);font-family:var(--mono);
 .mc-badge.cl{background:#271505;border-color:#b45309;color:#fcd34d;}
 .mc-label{font-size:10.5px;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .mc-meta{font-size:9px;color:var(--muted);white-space:nowrap;}
+
+body.light .mc-row:hover{background:rgba(0,0,0,.03);}
+body.light .mc-badge.ds{background:#ede9ff;border-color:#7c3aed;color:#5b21b6;}
+body.light .mc-badge.sc{background:#d1fae5;border-color:#059669;color:#065f46;}
+body.light .mc-badge.cl{background:#fef3c7;border-color:#b45309;color:#92400e;}
 
 /* Ensemble stepper */
 .ens-stepper{display:none;margin-top:10px;margin-bottom:4px;}
@@ -847,6 +1013,10 @@ html,body{background:var(--bg);color:var(--text);font-family:var(--mono);
 .btn-save-ref{font-size:9.5px;padding:3px 9px;background:var(--surf);border:1px solid var(--bd);border-radius:4px;color:var(--text);cursor:pointer;white-space:nowrap;font-family:var(--mono);}
 .btn-save-ref:hover{background:var(--surf2);}
 
+body.light .ref-mbtn.ds{border-color:#7c3aed;color:#5b21b6;}
+body.light .ref-mbtn.sc{border-color:#059669;color:#065f46;}
+body.light .ref-mbtn.cl{border-color:#b45309;color:#92400e;}
+
 /* Metrics section shared */
 .ref-metrics-section{display:none;margin-top:14px;}
 .ref-metrics-section.on{display:block;animation:fup .24s var(--ease) forwards}
@@ -861,7 +1031,14 @@ html,body{background:var(--bg);color:var(--text);font-family:var(--mono);
 <body>
 
 <div class="hdr">
-  <div class="wordmark"><span class="pulse-dot"></span>Codexter</div>
+  <div class="wordmark">
+    <span class="pulse-dot"></span>
+    Codexter
+    <button class="theme-toggle" id="theme-toggle" onclick="toggleTheme()" title="Toggle light/dark mode">
+      <span class="theme-toggle-icon" id="theme-icon">☀</span>
+      <span class="theme-toggle-label" id="theme-label">Light</span>
+    </button>
+  </div>
   <div class="tagline">AI-powered test &amp; refactor</div>
 </div>
 
@@ -1122,10 +1299,13 @@ html,body{background:var(--bg);color:var(--text);font-family:var(--mono);
     <button class="fc-dismiss" id="ref-dismiss" title="Clear file" onclick="clearRef()">×</button>
   </div>
 
-  <!-- Sub-tabs: Multi-Model vs TRL+PPO -->
+  <!-- Sub-tabs: Multi-Model vs TRL+PPO vs AST vs SA vs RAG -->
   <div class="inner-tabs-wrap">
     <button class="itab on" id="rtab-mm"  onclick="rSwitch('mm',this)">◈ Multi-Model</button>
     <button class="itab"    id="rtab-ppo" onclick="rSwitch('ppo',this)">⟳ TRL+PPO</button>
+    <button class="itab"    id="rtab-ast" onclick="rSwitch('ast',this)">⬡ AST Rules</button>
+    <button class="itab"    id="rtab-sa"  onclick="rSwitch('sa',this)">❄ Sim. Anneal</button>
+    <button class="itab"    id="rtab-rag" onclick="rSwitch('rag',this)">◉ RAG</button>
   </div>
 
   <!-- ── Multi-Model sub-panel ── -->
@@ -1235,6 +1415,140 @@ html,body{background:var(--bg);color:var(--text);font-family:var(--mono);
     </div>
   </div><!-- /rsp-ppo -->
 
+  <!-- ── AST Rule-Engine sub-panel ── -->
+  <div class="spanel" id="rsp-ast">
+    <div style="font-size:9px;color:var(--muted);margin-bottom:10px;padding:6px 9px;background:var(--surf2);border:1px solid var(--bd);border-radius:5px;line-height:1.6;">
+      <span style="color:var(--text)">Deterministic, zero-LLM refactoring</span> via Python's <span style="color:var(--text)">ast</span> module.
+      Applies rules: unused import removal, bare-except fixing, bool simplification, duplicate statement removal, type-hint stubs, module docstrings.
+    </div>
+    <button class="btn btn-green" id="btn-ast-run" onclick="runAst()" disabled>⬡ Run AST Refactor</button>
+    <div class="loader" id="ld-ast"><div class="ring green"></div><span class="loader-txt" id="ld-ast-txt">Applying AST rules…</span></div>
+    <div class="progress-wrap" id="ast-prog-wrap" style="display:none;margin-top:10px;"><div class="progress-bar green" id="ast-prog-bar"></div></div>
+    <div class="progress-label" id="ast-prog-lbl" style="display:none"></div>
+    <div class="pill" id="pill-ast"><span class="pdot"></span><span id="pill-ast-txt"></span></div>
+    <div class="ref-metrics-section" id="ast-metrics-section">
+      <div class="section-hdr">Metrics Delta</div>
+      <div class="ppo-mtable">
+        <div class="ppo-mhdr"><span>Rule</span><span>CC Δ</span><span>PEP8 Δ</span><span>HD Δ</span><span>LOC Δ</span><span>Reward</span></div>
+        <div id="ast-mrows"></div>
+      </div>
+      <div style="margin-top:8px;">
+        <div class="section-hdr">Rules Applied</div>
+        <div id="ast-changes-list" style="font-size:9.5px;color:var(--muted);line-height:1.8;padding:6px 9px;background:var(--surf2);border:1px solid var(--bd);border-radius:5px;"></div>
+      </div>
+    </div>
+    <div class="ref-code-section" id="ast-code-section">
+      <div class="section-hdr">Refactored Code</div>
+      <div class="ref-code-wrap">
+        <div class="ref-code-hdr">
+          <span class="ref-code-title">AST rule-engine output</span>
+          <button class="btn-save-ref" onclick="saveAstChoice()">💾 Save</button>
+        </div>
+        <pre class="ref-code-pre" id="ast-code-pre"></pre>
+      </div>
+    </div>
+  </div><!-- /rsp-ast -->
+
+  <!-- ── Simulated Annealing sub-panel ── -->
+  <div class="spanel" id="rsp-sa">
+    <div style="font-size:9px;color:var(--muted);margin-bottom:10px;padding:6px 9px;background:var(--surf2);border:1px solid var(--bd);border-radius:5px;line-height:1.6;">
+      <span style="color:var(--text)">Stochastic search</span> over atomic refactoring moves (PEP 8, bool simplification, rename, docstring, extract, dead-code).
+      Accepts worse solutions early (high T) and converges to a local optimum as temperature cools geometrically.
+    </div>
+    <!-- Model picker for SA -->
+    <div class="model-pick-wrap">
+      <div class="model-pick-title">LLM for assisted moves</div>
+      <div class="model-checks">
+        <div class="mc-row checked" id="sa-mc-ds" onclick="selectSaModel('deepseek-coder:1.3b',this)">
+          <input type="radio" name="sa-model" checked>
+          <span class="mc-badge ds">DS</span><span class="mc-label">deepseek-coder:1.3b</span><span class="mc-meta">1.3B · fast</span>
+        </div>
+        <div class="mc-row" id="sa-mc-sc" onclick="selectSaModel('starcoder2:3b',this)">
+          <input type="radio" name="sa-model">
+          <span class="mc-badge sc">SC</span><span class="mc-label">starcoder2:3b</span><span class="mc-meta">3B</span>
+        </div>
+        <div class="mc-row" id="sa-mc-cl" onclick="selectSaModel('codellama:7b',this)">
+          <input type="radio" name="sa-model">
+          <span class="mc-badge cl">CL</span><span class="mc-label">codellama:7b</span><span class="mc-meta">7B · quality</span>
+        </div>
+      </div>
+    </div>
+    <button class="btn btn-teal" id="btn-sa-run" onclick="runSa()" disabled>❄ Run Simulated Annealing</button>
+    <div class="loader" id="ld-sa"><div class="ring teal"></div><span class="loader-txt" id="ld-sa-txt">Initialising SA loop…</span></div>
+    <div class="progress-wrap" id="sa-prog-wrap" style="display:none;margin-top:10px;"><div class="progress-bar teal" id="sa-prog-bar"></div></div>
+    <div class="progress-label" id="sa-prog-lbl" style="display:none"></div>
+    <div class="ens-stepper" id="sa-stepper">
+      <div class="ens-step-hdr">SA Steps</div>
+      <div class="ens-steps" id="sa-steps"></div>
+    </div>
+    <div class="pill" id="pill-sa"><span class="pdot"></span><span id="pill-sa-txt"></span></div>
+    <div class="ref-metrics-section" id="sa-metrics-section">
+      <div class="section-hdr">SA Steps (Energy / Move)</div>
+      <div class="ppo-mtable">
+        <div class="ppo-mhdr"><span>Step</span><span>T</span><span>Move</span><span>ΔE</span><span>Accept</span><span>Reward</span></div>
+        <div id="sa-mrows"></div>
+      </div>
+    </div>
+    <div class="ref-code-section" id="sa-code-section">
+      <div class="section-hdr">Best Refactored Code</div>
+      <div class="ref-code-wrap">
+        <div class="ref-code-hdr">
+          <span class="ref-code-title" id="sa-code-title">best SA output</span>
+          <button class="btn-save-ref" onclick="saveSaChoice()">💾 Save</button>
+        </div>
+        <pre class="ref-code-pre" id="sa-code-pre"></pre>
+      </div>
+    </div>
+  </div><!-- /rsp-sa -->
+
+  <!-- ── RAG sub-panel ── -->
+  <div class="spanel" id="rsp-rag">
+    <div style="font-size:9px;color:var(--muted);margin-bottom:10px;padding:6px 9px;background:var(--surf2);border:1px solid var(--bd);border-radius:5px;line-height:1.6;">
+      <span style="color:var(--text)">Retrieval-Augmented Generation</span> — queries a local vector store (chromadb + sentence-transformers, or AST-Jaccard fallback) for similar clean-code patterns, then uses them as few-shot examples in the LLM prompt.
+    </div>
+    <!-- Model picker for RAG -->
+    <div class="model-pick-wrap">
+      <div class="model-pick-title">LLM for RAG-guided refactor</div>
+      <div class="model-checks">
+        <div class="mc-row checked" id="rag-mc-ds" onclick="selectRagModel('deepseek-coder:1.3b',this)">
+          <input type="radio" name="rag-model" checked>
+          <span class="mc-badge ds">DS</span><span class="mc-label">deepseek-coder:1.3b</span><span class="mc-meta">1.3B · fast</span>
+        </div>
+        <div class="mc-row" id="rag-mc-sc" onclick="selectRagModel('starcoder2:3b',this)">
+          <input type="radio" name="rag-model">
+          <span class="mc-badge sc">SC</span><span class="mc-label">starcoder2:3b</span><span class="mc-meta">3B</span>
+        </div>
+        <div class="mc-row" id="rag-mc-cl" onclick="selectRagModel('codellama:7b',this)">
+          <input type="radio" name="rag-model">
+          <span class="mc-badge cl">CL</span><span class="mc-label">codellama:7b</span><span class="mc-meta">7B · quality</span>
+        </div>
+      </div>
+    </div>
+    <button class="btn btn-violet" id="btn-rag-run" onclick="runRag()" disabled>◉ Run RAG Refactor</button>
+    <div class="loader" id="ld-rag"><div class="ring"></div><span class="loader-txt" id="ld-rag-txt">Retrieving patterns…</span></div>
+    <div class="progress-wrap" id="rag-prog-wrap" style="display:none;margin-top:10px;"><div class="progress-bar" id="rag-prog-bar"></div></div>
+    <div class="progress-label" id="rag-prog-lbl" style="display:none"></div>
+    <div class="pill" id="pill-rag"><span class="pdot"></span><span id="pill-rag-txt"></span></div>
+    <div class="ref-metrics-section" id="rag-metrics-section">
+      <div class="section-hdr">Retrieved Examples + Metrics</div>
+      <div id="rag-examples-list" style="margin-bottom:10px;font-size:9px;color:var(--muted);line-height:1.7;"></div>
+      <div class="ppo-mtable">
+        <div class="ppo-mhdr"><span>Backend</span><span>CC Δ</span><span>PEP8 Δ</span><span>HD Δ</span><span>LOC Δ</span><span>Reward</span></div>
+        <div id="rag-mrows"></div>
+      </div>
+    </div>
+    <div class="ref-code-section" id="rag-code-section">
+      <div class="section-hdr">Refactored Code</div>
+      <div class="ref-code-wrap">
+        <div class="ref-code-hdr">
+          <span class="ref-code-title" id="rag-code-title">RAG-guided output</span>
+          <button class="btn-save-ref" onclick="saveRagChoice()">💾 Save</button>
+        </div>
+        <pre class="ref-code-pre" id="rag-code-pre"></pre>
+      </div>
+    </div>
+  </div><!-- /rsp-rag -->
+
 </div><!-- /mp-refactor -->
 
 <script>
@@ -1248,6 +1562,27 @@ const PPO_MODELS = [
 ];
 
 /* ══════════════════════════════════════════════
+   Theme toggle
+══════════════════════════════════════════════ */
+function toggleTheme() {
+  const body = document.body;
+  const isLight = body.classList.toggle('light');
+  document.getElementById('theme-icon').textContent  = isLight ? '☽' : '☀';
+  document.getElementById('theme-label').textContent = isLight ? 'Dark' : 'Light';
+  try { localStorage.setItem('codexter-theme', isLight ? 'light' : 'dark'); } catch(e){}
+}
+
+(function initTheme(){
+  try {
+    if(localStorage.getItem('codexter-theme') === 'light'){
+      document.body.classList.add('light');
+      document.getElementById('theme-icon').textContent  = '☽';
+      document.getElementById('theme-label').textContent = 'Dark';
+    }
+  } catch(e){}
+})();
+
+/* ══════════════════════════════════════════════
    State
 ══════════════════════════════════════════════ */
 let singleFilePath = '', singleDirPath = '', singleModuleName = '';
@@ -1257,15 +1592,14 @@ const pollTimers = {};
 let connApiOk = false, connOllamaOk = false;
 
 // Single-file approach state
-let sgApproach = 'pynguin'; // 'pynguin' | 'llm' | 'hybrid'
-let sgAlgos    = new Set(['RANDOM','WHOLE_SUITE','DYNAMOSA']); // for pynguin
-let sgLlms     = new Set(['deepseek-coder:1.3b']);              // for llm
+let sgApproach = 'pynguin';
+let sgAlgos    = new Set(['RANDOM','WHOLE_SUITE','DYNAMOSA']);
+let sgLlms     = new Set(['deepseek-coder:1.3b']);
 let sgHybridAlgo = 'RANDOM';
 let sgHybridLlm  = 'deepseek-coder:1.3b';
 let sgRunning    = false;
 let sgPollTimer  = null;
 let sgJobId      = null;
-// Results store: { key, label, code, coverage, mutationScore, status, error }
 let sgResults = [];
 
 // PPO state
@@ -1283,6 +1617,23 @@ let mmResults = [];
 let mmSelectedModel = null;
 let mmPollTimer = null;
 let mmCurrentJobId = null;
+
+// AST refactor state
+let astRunning = false;
+let astBestCode = null;
+let astPollTimer = null;
+
+// Simulated Annealing state
+let saRunning = false;
+let saBestCode = null;
+let saSelectedModel = 'deepseek-coder:1.3b';
+let saPollTimer = null;
+
+// RAG state
+let ragRunning = false;
+let ragBestCode = null;
+let ragSelectedModel = 'deepseek-coder:1.3b';
+let ragPollTimer = null;
 
 /* ══════════════════════════════════════════════
    Connection bar
@@ -1336,11 +1687,10 @@ function selectApproach(ap) {
   updateRunBtn();
 }
 
-/* ── Pynguin algorithm toggles ── */
 function toggleAlgo(algo, rowEl) {
   const cb = rowEl.querySelector('input[type=checkbox]');
   if(sgAlgos.has(algo)){
-    if(sgAlgos.size === 1) return; // keep at least 1
+    if(sgAlgos.size === 1) return;
     sgAlgos.delete(algo); rowEl.classList.remove('checked'); cb.checked=false;
   } else {
     sgAlgos.add(algo); rowEl.classList.add('checked'); cb.checked=true;
@@ -1348,7 +1698,6 @@ function toggleAlgo(algo, rowEl) {
   updateRunBtn();
 }
 
-/* ── LLM model toggles ── */
 function toggleLlm(model, rowEl) {
   const cb = rowEl.querySelector('input[type=checkbox]');
   if(sgLlms.has(model)){
@@ -1360,7 +1709,6 @@ function toggleLlm(model, rowEl) {
   updateRunBtn();
 }
 
-/* ── Hybrid radio selectors ── */
 function selectHybridAlgo(algo, rowEl) {
   sgHybridAlgo = algo;
   document.querySelectorAll('#cfg-hybrid .sel-row.hybrid-a').forEach(r=>{
@@ -1382,16 +1730,13 @@ function updateRunBtn() {
   let valid = hasFile && !sgRunning;
   btn.disabled = !valid;
 
-  // Button label / colour per approach
   btn.className = 'btn ' + (sgApproach==='hybrid' ? 'btn-teal' : sgApproach==='llm' ? 'btn-amber' : 'btn-violet');
   const labels = { pynguin:'⬡ Generate Tests (Pynguin)', llm:'◈ Generate Tests (LLM)', hybrid:'⟳ Generate Tests (Hybrid)' };
   btn.textContent = labels[sgApproach] || '⬡ Generate Tests';
 
-  // Ring colour
   const ring = document.getElementById('single-ring');
   ring.className = 'ring ' + (sgApproach==='hybrid' ? 'teal' : sgApproach==='llm' ? 'amber' : '');
 
-  // Progress bar colour
   const bar = document.getElementById('single-prog-bar');
   bar.className = 'progress-bar ' + (sgApproach==='hybrid' ? 'teal' : sgApproach==='llm' ? 'amber' : '');
 }
@@ -1436,7 +1781,6 @@ function genSingle() {
   setLoader('single', true, 'Submitting…');
   showProgress('single', 0, 'Starting…');
 
-  // Dispatch based on approach
   if(sgApproach === 'pynguin') {
     _dispatchPynguin();
   } else if(sgApproach === 'llm') {
@@ -1446,12 +1790,7 @@ function genSingle() {
   }
 }
 
-/* ── Dispatch: pynguin ── */
 function _dispatchPynguin() {
-  // We re-use the existing /generate-tests endpoint which already runs pynguin algos
-  // But we need to tell backend which algos. For now we pass all selected; 
-  // the backend runs RANDOM/WHOLE_SUITE/DYNAMOSA based on PYNGUIN_ALGORITHMS constant.
-  // We filter results client-side to only show selected algos.
   vscode.postMessage({
     type: 'generateSingle',
     filePath: singleFilePath,
@@ -1461,7 +1800,6 @@ function _dispatchPynguin() {
   });
 }
 
-/* ── Dispatch: LLM ── */
 function _dispatchLlm() {
   vscode.postMessage({
     type: 'generateSingle',
@@ -1472,7 +1810,6 @@ function _dispatchLlm() {
   });
 }
 
-/* ── Dispatch: Hybrid ── */
 function _dispatchHybrid() {
   vscode.postMessage({
     type: 'generateSingle',
@@ -1524,13 +1861,11 @@ function handleSingleJobComplete(jobData) {
   }
 }
 
-/* ── Render: pynguin results ── */
 function _renderPynguinResults(jobData) {
   const results = (jobData.results || []).filter(r => sgAlgos.has(r.algorithm));
   const ok = results.filter(r=>r.status==='success').length;
   showPill('single','ok', ok+'/'+results.length+' algorithm'+(results.length!==1?'s':'')+' succeeded');
 
-  // Header
   document.getElementById('single-metrics-head').innerHTML =
     '<div class="gt-row pynguin-row hd">' +
       '<div class="gt-cell">Algorithm</div>' +
@@ -1540,7 +1875,6 @@ function _renderPynguinResults(jobData) {
       '<div class="gt-cell right">Status</div>' +
     '</div>';
 
-  // Rows
   const rowsEl = document.getElementById('single-metrics-rows');
   rowsEl.innerHTML = '';
   results.forEach(r => {
@@ -1558,7 +1892,6 @@ function _renderPynguinResults(jobData) {
     rowsEl.appendChild(row);
   });
 
-  // File cards (one per algo)
   _renderFileCards(results.map(r => ({
     label: r.algorithm,
     labelClass: 'algo-badge '+(r.algorithm||'').toLowerCase(),
@@ -1568,9 +1901,7 @@ function _renderPynguinResults(jobData) {
   })));
 }
 
-/* ── Render: LLM results ── */
 function _renderLlmResults(jobData) {
-  // jobData.results is an array with one entry per model (backend runs sequentially)
   const results = jobData.results || [];
   const ok = results.filter(r=>r.status==='success').length;
   showPill('single','ok', ok+'/'+results.length+' model'+(results.length!==1?'s':'')+' succeeded');
@@ -1608,10 +1939,7 @@ function _renderLlmResults(jobData) {
   })));
 }
 
-/* ── Render: Hybrid results ── */
 function _renderHybridResults(jobData) {
-  // Results: algo raw output + refined output
-  // jobData.results = array of algo result(s), jobData.refinement = {status, refined_code}
   const algoResults = (jobData.results || []).filter(r => r.algorithm === sgHybridAlgo);
   const refinement  = jobData.refinement || null;
 
@@ -1631,7 +1959,6 @@ function _renderHybridResults(jobData) {
   const rowsEl = document.getElementById('single-metrics-rows');
   rowsEl.innerHTML = '';
 
-  // Algo raw row
   if(algoResults.length) {
     const r = algoResults[0];
     const cov = r.metrics?.coverage_percent ?? Math.round((r.coverage||0)*100);
@@ -1648,7 +1975,6 @@ function _renderHybridResults(jobData) {
     rowsEl.appendChild(rawRow);
   }
 
-  // Refined row
   const refRow = document.createElement('div');
   refRow.className = 'gt-row hybrid-row';
   const algoLow = sgHybridAlgo.toLowerCase();
@@ -1661,7 +1987,6 @@ function _renderHybridResults(jobData) {
     '<div class="gt-cell right">'+(refOk?'<span class="tag ok">refined</span>':'<span class="tag err">failed</span>')+'</div>';
   rowsEl.appendChild(refRow);
 
-  // File cards: algo raw + refined
   const cards = [];
   if(algoResults.length && algoResults[0].content) {
     const r = algoResults[0];
@@ -1685,14 +2010,13 @@ function _renderHybridResults(jobData) {
   _renderFileCards(cards);
 }
 
-/* ── File card renderer ── */
 function _renderFileCards(cards) {
   const body = document.getElementById('single-file-cards-body');
   body.innerHTML = '';
   if(!cards.length) return;
 
   cards.forEach((c, idx) => {
-    const collapsed = idx > 0; // first card expanded, rest collapsed
+    const collapsed = idx > 0;
     const cardEl = document.createElement('div');
     cardEl.className = 'test-file-card';
     cardEl.id = 'tfc-'+idx;
@@ -1725,7 +2049,6 @@ function _renderFileCards(cards) {
     body.appendChild(cardEl);
   });
 
-  // Store card data for save handler
   window._sgCardData = cards;
   document.getElementById('single-file-cards').classList.add('on');
 }
@@ -1761,11 +2084,9 @@ function onSingleJobStatus(s) {
     setLoader('single', true, lbl);
     showProgress('single', pct, pct+'% — '+lbl);
 
-    // Show partial pynguin results during processing
     if(sgApproach === 'pynguin' && s.algo_results && s.algo_results.length) {
       const partial = s.algo_results.filter(r => sgAlgos.has(r.algorithm));
       if(partial.length) {
-        // Build partial table
         document.getElementById('single-metrics-head').innerHTML =
           '<div class="gt-row pynguin-row hd">' +
             '<div class="gt-cell">Algorithm</div>'+
@@ -2147,6 +2468,19 @@ function clearRef() {
   document.getElementById('ppo-stepper').classList.remove('on');
   hideProgress('ppo'); setLoader('ppo',false); hidePill('ppo');
   document.getElementById('btn-ppo-run').disabled = true;
+  document.getElementById('ast-metrics-section').classList.remove('on');
+  document.getElementById('ast-code-section').classList.remove('on');
+  hideProgress('ast'); setLoader('ast',false); hidePill('ast');
+  document.getElementById('btn-ast-run').disabled = true;
+  document.getElementById('sa-metrics-section').classList.remove('on');
+  document.getElementById('sa-code-section').classList.remove('on');
+  document.getElementById('sa-stepper').classList.remove('on');
+  hideProgress('sa'); setLoader('sa',false); hidePill('sa');
+  document.getElementById('btn-sa-run').disabled = true;
+  document.getElementById('rag-metrics-section').classList.remove('on');
+  document.getElementById('rag-code-section').classList.remove('on');
+  hideProgress('rag'); setLoader('rag',false); hidePill('rag');
+  document.getElementById('btn-rag-run').disabled = true;
 }
 
 /* ══════════════════════════════════════════════
@@ -2295,6 +2629,7 @@ window.addEventListener('message', ev=>{
       if(fp) rd.classList.add('visible'); else rd.classList.remove('visible');
       document.getElementById('btn-mm-run').disabled = !fp;
       updatePpoBtn();
+      updateAstBtn(); updateSaBtn(); updateRagBtn();
       break;
     }
 
@@ -2319,7 +2654,6 @@ window.addEventListener('message', ev=>{
     case 'jobStarted': {
       const scope=m.scope;
       if(scope==='single') {
-        // sgPollTimer already handled by this branch
         setLoader('single', true, 'Running pipeline…');
         showProgress('single', 0, 'Starting…');
         startPolling(scope, m.jobId);
@@ -2337,6 +2671,9 @@ window.addEventListener('message', ev=>{
 
       if(scope==='ppo_refactor'){ onPpoJobStatus(s); break; }
       if(scope==='mm_refactor'){  onMmJobStatus(s);  break; }
+      if(scope==='ast_refactor'){ onAstJobStatus(s); break; }
+      if(scope==='sa_refactor'){  onSaJobStatus(s);  break; }
+      if(scope==='rag_refactor'){ onRagJobStatus(s); break; }
 
       if(scope==='single') {
         onSingleJobStatus(s);
@@ -2346,7 +2683,6 @@ window.addEventListener('message', ev=>{
         break;
       }
 
-      // ZIP polling
       if(s.status==='queued'||s.status==='processing'){
         const pct=s.progress||0;
         const phaseLabel=s.phase_label||(s.phase==='pynguin'?'Running Pynguin algorithms…':s.phase==='refining'?'Refining with DeepSeek…':'Running pipeline…');
@@ -2400,6 +2736,36 @@ window.addEventListener('message', ev=>{
       showPill('mm','err', m.error||'Multi-model refactor failed');
       break;
 
+    case 'astJobStarted':
+      startAstPoll(m.jobId);
+      break;
+    case 'astJobError':
+      stopAstPoll(); astRunning=false;
+      setLoader('ast',false); hideProgress('ast');
+      document.getElementById('btn-ast-run').disabled=false;
+      showPill('ast','err',m.error||'AST refactor failed');
+      break;
+
+    case 'saJobStarted':
+      startSaPoll(m.jobId);
+      break;
+    case 'saJobError':
+      stopSaPoll(); saRunning=false;
+      setLoader('sa',false); hideProgress('sa');
+      document.getElementById('btn-sa-run').disabled=false;
+      showPill('sa','err',m.error||'SA refactor failed');
+      break;
+
+    case 'ragJobStarted':
+      startRagPoll(m.jobId);
+      break;
+    case 'ragJobError':
+      stopRagPoll(); ragRunning=false;
+      setLoader('rag',false); hideProgress('rag');
+      document.getElementById('btn-rag-run').disabled=false;
+      showPill('rag','err',m.error||'RAG refactor failed');
+      break;
+
     case 'backendStatus':
       connApiOk=m.apiOk; connOllamaOk=m.ollamaOk;
       updateConnBar(
@@ -2413,6 +2779,281 @@ window.addEventListener('message', ev=>{
       break;
   }
 });
+
+/* ══════════════════════════════════════════════
+   AST Refactor
+══════════════════════════════════════════════ */
+function updateAstBtn() {
+  document.getElementById('btn-ast-run').disabled = !refactorPath || astRunning;
+}
+
+function runAst() {
+  if(!refactorPath){ showPill('ast','err','No Python file open'); return; }
+  if(!connApiOk){ showPill('ast','err','API offline — start the backend first'); return; }
+  astRunning = true; astBestCode = null;
+  document.getElementById('btn-ast-run').disabled = true;
+  document.getElementById('ast-metrics-section').classList.remove('on');
+  document.getElementById('ast-code-section').classList.remove('on');
+  document.getElementById('ast-mrows').innerHTML = '';
+  document.getElementById('ast-code-pre').textContent = '';
+  hidePill('ast');
+  setLoader('ast', true, 'Applying AST rules…');
+  setRefProgress('ast', 0, 'Starting…');
+  vscode.postMessage({ type:'refactorAst', filePath:refactorPath });
+}
+
+function startAstPoll(jobId) {
+  if(astPollTimer) clearInterval(astPollTimer);
+  astPollTimer = setInterval(()=>vscode.postMessage({type:'pollJob',jobId,scope:'ast_refactor'}),2000);
+}
+function stopAstPoll() {
+  if(astPollTimer){ clearInterval(astPollTimer); astPollTimer=null; }
+}
+
+function onAstJobStatus(s) {
+  if(s.status==='queued'||s.status==='processing'){
+    const pct=s.progress||0;
+    setRefProgress('ast',pct,s.phase_label||'Running…');
+    setLoader('ast',true,s.phase_label||'Running…');
+  } else {
+    onAstJobDone(s);
+  }
+}
+
+function onAstJobDone(s) {
+  stopAstPoll(); astRunning=false;
+  setLoader('ast',false); hideProgress('ast');
+  document.getElementById('btn-ast-run').disabled=false;
+  if(s.status==='error'){ showPill('ast','err',s.error||'Job failed'); return; }
+
+  const reward = s.reward!=null ? s.reward.toFixed(3) : '—';
+  showPill('ast','ok','AST refactor complete — reward: '+reward);
+
+  const d=s.delta||{};
+  const fmt=v=>v==null?'—':(v>0?'+':'')+v.toFixed(1);
+  const dc=v=>v==null?'delta-dim':v>0?'delta-pos':v<0?'delta-neg':'delta-neu';
+  const rwCls=s.reward==null?'delta-dim':s.reward>=0.3?'delta-pos':s.reward>=0?'delta-neu':'delta-neg';
+  document.getElementById('ast-mrows').innerHTML=
+    '<div class="ppo-mrow">'+
+    '<span style="color:var(--green);font-size:9px">ast-rules</span>'+
+    '<span class="'+dc(d.cyclomatic_delta)+'">'+fmt(d.cyclomatic_delta)+'</span>'+
+    '<span class="'+dc(d.pep8_delta)+'">'+fmt(d.pep8_delta)+'</span>'+
+    '<span class="'+dc(d.halstead_delta)+'">'+fmt(d.halstead_delta)+'</span>'+
+    '<span class="'+dc(d.loc_delta)+'">'+fmt(d.loc_delta)+'</span>'+
+    '<span class="'+rwCls+'">'+reward+'</span>'+
+    '</div>';
+  document.getElementById('ast-metrics-section').classList.add('on');
+
+  const changes=s.changes||[];
+  document.getElementById('ast-changes-list').innerHTML=
+    changes.map(c=>'• '+esc(c)).join('<br>') || '(no changes)';
+
+  if(s.refactored_code){
+    document.getElementById('ast-code-pre').textContent=s.refactored_code;
+    document.getElementById('ast-code-section').classList.add('on');
+    astBestCode=s.refactored_code;
+  }
+}
+
+function saveAstChoice(){
+  if(!astBestCode){ showPill('ast','err','No code to save'); return; }
+  vscode.postMessage({type:'saveRefactored',filePath:refactorPath,code:astBestCode,model:'ast-rules'});
+}
+
+/* ══════════════════════════════════════════════
+   Simulated Annealing Refactor
+══════════════════════════════════════════════ */
+function selectSaModel(model, rowEl){
+  saSelectedModel=model;
+  document.querySelectorAll('[id^="sa-mc-"]').forEach(r=>{
+    r.classList.remove('checked'); r.querySelector('input').checked=false;
+  });
+  rowEl.classList.add('checked'); rowEl.querySelector('input').checked=true;
+}
+function updateSaBtn(){
+  document.getElementById('btn-sa-run').disabled = !refactorPath || saRunning;
+}
+
+function runSa(){
+  if(!refactorPath){ showPill('sa','err','No Python file open'); return; }
+  if(!connApiOk){ showPill('sa','err','API offline — start the backend first'); return; }
+  saRunning=true; saBestCode=null;
+  document.getElementById('btn-sa-run').disabled=true;
+  document.getElementById('sa-metrics-section').classList.remove('on');
+  document.getElementById('sa-code-section').classList.remove('on');
+  document.getElementById('sa-stepper').classList.remove('on');
+  document.getElementById('sa-mrows').innerHTML='';
+  document.getElementById('sa-steps').innerHTML='';
+  document.getElementById('sa-code-pre').textContent='';
+  hidePill('sa');
+  setLoader('sa',true,'Submitting SA job…');
+  setRefProgress('sa',0,'Starting…');
+  vscode.postMessage({type:'refactorSa',filePath:refactorPath,model:saSelectedModel});
+}
+
+function startSaPoll(jobId){
+  if(saPollTimer) clearInterval(saPollTimer);
+  saPollTimer=setInterval(()=>vscode.postMessage({type:'pollJob',jobId,scope:'sa_refactor'}),2000);
+}
+function stopSaPoll(){ if(saPollTimer){clearInterval(saPollTimer);saPollTimer=null;} }
+
+function onSaJobStatus(s){
+  if(s.status==='queued'||s.status==='processing'){
+    const pct=s.progress||0;
+    setRefProgress('sa',pct,s.phase_label||'SA running…');
+    setLoader('sa',true,s.phase_label||'SA running…');
+    if(s.iterations&&s.iterations.length) renderSaSteps(s.iterations);
+  } else { onSaJobDone(s); }
+}
+
+function renderSaSteps(iters){
+  const stepsEl=document.getElementById('sa-steps');
+  stepsEl.innerHTML='';
+  document.getElementById('sa-stepper').classList.add('on');
+  iters.forEach(it=>{
+    const d=document.createElement('div');
+    d.className='ens-step '+(it.accepted?'done':'');
+    const temp=(it.temperature!=null?it.temperature.toFixed(3):'—');
+    d.innerHTML='<div class="ens-step-top">'+
+      '<span class="step-ico">'+(it.accepted?'✓':'↺')+'</span>'+
+      '<span class="step-name">Iter '+it.iteration+' — '+esc((it.action||'').slice(0,40))+'</span>'+
+      '<span class="step-status">T='+temp+' reward:'+(it.reward!=null?it.reward.toFixed(3):'—')+'</span>'+
+      '</div>';
+    stepsEl.appendChild(d);
+  });
+  document.getElementById('sa-metrics-section').classList.add('on');
+  const rowsEl=document.getElementById('sa-mrows');
+  rowsEl.innerHTML='';
+  iters.forEach(it=>{
+    const d2=it.delta||{};
+    const fmt=v=>v==null?'—':(v>0?'+':'')+v.toFixed(1);
+    const dc=v=>v==null?'delta-dim':v>0?'delta-pos':v<0?'delta-neg':'delta-neu';
+    const rw=it.reward!=null?it.reward:0;
+    const rwCls=rw>=0.3?'delta-pos':rw>=0?'delta-neu':'delta-neg';
+    const temp=(it.temperature!=null?it.temperature.toFixed(3):'—');
+    const acceptTag=it.accepted?'<span class="tag ok sm">✓</span>':'<span class="tag err sm">✗</span>';
+    const row=document.createElement('div');
+    row.className='ppo-mrow';
+    row.innerHTML=
+      '<span style="color:var(--muted)">iter '+it.iteration+'</span>'+
+      '<span style="color:var(--muted2);font-size:8.5px">'+temp+'</span>'+
+      '<span style="font-size:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc((it.action||'').slice(0,18))+'</span>'+
+      '<span class="'+dc(d2.cyclomatic_delta)+'">'+fmt(d2.cyclomatic_delta)+'</span>'+
+      '<span>'+acceptTag+'</span>'+
+      '<span class="'+rwCls+'">'+(it.reward!=null?it.reward.toFixed(3):'—')+'</span>';
+    rowsEl.appendChild(row);
+  });
+}
+
+function onSaJobDone(s){
+  stopSaPoll(); saRunning=false;
+  setLoader('sa',false); hideProgress('sa');
+  document.getElementById('btn-sa-run').disabled=false;
+  document.getElementById('sa-stepper').classList.remove('on');
+  if(s.status==='error'){ showPill('sa','err',s.error||'Job failed'); return; }
+  const steps=s.total_iterations||s.total_steps||0;
+  const best=s.best_reward!=null?s.best_reward.toFixed(3):'—';
+  showPill('sa','ok',steps+' iteration(s) — best reward: '+best);
+  if(s.iterations&&s.iterations.length) renderSaSteps(s.iterations);
+  if(s.best_code){
+    document.getElementById('sa-code-pre').textContent=s.best_code;
+    document.getElementById('sa-code-section').classList.add('on');
+    saBestCode=s.best_code;
+  }
+}
+function saveSaChoice(){
+  if(!saBestCode){ showPill('sa','err','No code to save'); return; }
+  vscode.postMessage({type:'saveRefactored',filePath:refactorPath,code:saBestCode,model:'sa-'+saSelectedModel});
+}
+
+/* ══════════════════════════════════════════════
+   RAG Refactor
+══════════════════════════════════════════════ */
+function selectRagModel(model,rowEl){
+  ragSelectedModel=model;
+  document.querySelectorAll('[id^="rag-mc-"]').forEach(r=>{
+    r.classList.remove('checked'); r.querySelector('input').checked=false;
+  });
+  rowEl.classList.add('checked'); rowEl.querySelector('input').checked=true;
+}
+function updateRagBtn(){
+  document.getElementById('btn-rag-run').disabled = !refactorPath || ragRunning;
+}
+
+function runRag(){
+  if(!refactorPath){ showPill('rag','err','No Python file open'); return; }
+  if(!connApiOk){ showPill('rag','err','API offline — start the backend first'); return; }
+  ragRunning=true; ragBestCode=null;
+  document.getElementById('btn-rag-run').disabled=true;
+  document.getElementById('rag-metrics-section').classList.remove('on');
+  document.getElementById('rag-code-section').classList.remove('on');
+  document.getElementById('rag-mrows').innerHTML='';
+  document.getElementById('rag-examples-list').innerHTML='';
+  document.getElementById('rag-code-pre').textContent='';
+  hidePill('rag');
+  setLoader('rag',true,'Retrieving similar patterns…');
+  setRefProgress('rag',0,'Starting…');
+  vscode.postMessage({type:'refactorRag',filePath:refactorPath,model:ragSelectedModel});
+}
+
+function startRagPoll(jobId){
+  if(ragPollTimer) clearInterval(ragPollTimer);
+  ragPollTimer=setInterval(()=>vscode.postMessage({type:'pollJob',jobId,scope:'rag_refactor'}),2000);
+}
+function stopRagPoll(){ if(ragPollTimer){clearInterval(ragPollTimer);ragPollTimer=null;} }
+
+function onRagJobStatus(s){
+  if(s.status==='queued'||s.status==='processing'){
+    const pct=s.progress||0;
+    setRefProgress('rag',pct,s.phase_label||'RAG running…');
+    setLoader('rag',true,s.phase_label||'RAG running…');
+  } else { onRagJobDone(s); }
+}
+
+function onRagJobDone(s){
+  stopRagPoll(); ragRunning=false;
+  setLoader('rag',false); hideProgress('rag');
+  document.getElementById('btn-rag-run').disabled=false;
+  if(s.status==='error'){ showPill('rag','err',s.error||'Job failed'); return; }
+  const reward=s.reward!=null?s.reward.toFixed(3):'—';
+  const patterns=s.retrieved_patterns||[];
+  const nEx=s.num_examples_used||patterns.length||0;
+  showPill('rag','ok',nEx+' pattern(s) retrieved — reward: '+reward);
+
+  const exList=document.getElementById('rag-examples-list');
+  if(patterns.length){
+    exList.innerHTML='<strong style="color:var(--text)">Retrieved patterns:</strong><br>'+
+      patterns.map((p,i)=>'&nbsp;'+(i+1)+'. '+esc(typeof p==='string'?p:(p.description||p.title||'unknown'))).join('<br>');
+  } else {
+    exList.innerHTML='';
+  }
+
+  const d=s.delta||{};
+  const fmt=v=>v==null?'—':(v>0?'+':'')+v.toFixed(1);
+  const dc=v=>v==null?'delta-dim':v>0?'delta-pos':v<0?'delta-neg':'delta-neu';
+  const rwCls=s.reward==null?'delta-dim':s.reward>=0.3?'delta-pos':s.reward>=0?'delta-neu':'delta-neg';
+  document.getElementById('rag-mrows').innerHTML=
+    '<div class="ppo-mrow">'+
+    '<span style="font-size:8px;color:var(--accent2)">'+esc(s.embedding_backend||'tfidf')+'</span>'+
+    '<span class="'+dc(d.cyclomatic_delta)+'">'+fmt(d.cyclomatic_delta)+'</span>'+
+    '<span class="'+dc(d.pep8_delta)+'">'+fmt(d.pep8_delta)+'</span>'+
+    '<span class="'+dc(d.halstead_delta)+'">'+fmt(d.halstead_delta)+'</span>'+
+    '<span class="'+dc(d.loc_delta)+'">'+fmt(d.loc_delta)+'</span>'+
+    '<span class="'+rwCls+'">'+reward+'</span>'+
+    '</div>';
+  document.getElementById('rag-metrics-section').classList.add('on');
+
+  if(s.refactored_code){
+    document.getElementById('rag-code-pre').textContent=s.refactored_code;
+    document.getElementById('rag-code-title').textContent='RAG output ('+ragSelectedModel+')';
+    document.getElementById('rag-code-section').classList.add('on');
+    ragBestCode=s.refactored_code;
+  }
+}
+function saveRagChoice(){
+  if(!ragBestCode){ showPill('rag','err','No code to save'); return; }
+  vscode.postMessage({type:'saveRefactored',filePath:refactorPath,code:ragBestCode,model:'rag-'+ragSelectedModel});
+}
 
 vscode.postMessage({type:'requestActiveFile'});
 triggerCheck();
