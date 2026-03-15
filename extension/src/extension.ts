@@ -77,7 +77,15 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
           await this.pickZipFile();
           break;
         case "generateSingle":
-          await this.handleSingleGeneration(msg.filePath, msg.dirPath);
+          await this.handleSingleGeneration(
+            msg.filePath,
+            msg.dirPath,
+            msg.approach,
+            msg.selectedAlgos,
+            msg.selectedModels,
+            msg.hybridAlgo,
+            msg.hybridLlm,
+          );
           break;
         case "generateZip":
           await this.handleZipGeneration(
@@ -151,7 +159,15 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
 
   // ── Test Generation handlers ────────────────────────────────────────────────
 
-  private async handleSingleGeneration(filePath: string, dirPath: string) {
+  private async handleSingleGeneration(
+    filePath: string,
+    dirPath: string,
+    approach: string = "pynguin",
+    selectedAlgos?: string[],
+    selectedModels?: string[],
+    hybridAlgo?: string,
+    hybridLlm?: string,
+  ) {
     this._view?.webview.postMessage({
       type: "generationStarted",
       scope: "single",
@@ -171,6 +187,12 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
           module_name: moduleName,
           directory: dirPath,
           file_path: filePath,
+          // Approach routing — snake_case to match backend Pydantic model
+          approach,
+          selected_algos: selectedAlgos,
+          selected_models: selectedModels,
+          hybrid_algo: hybridAlgo,
+          hybrid_llm: hybridLlm,
         },
         { timeout: 30000 },
       );
