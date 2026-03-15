@@ -30,7 +30,6 @@ Codexter is a VS Code extension backed by a local FastAPI server. It analyses yo
 - [API Reference](#api-reference)
 - [Configuration](#configuration)
 - [Troubleshooting](#troubleshooting)
-- [Project Structure](#project-structure)
 
 ---
 
