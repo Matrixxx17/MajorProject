@@ -109,8 +109,7 @@ class SingleFileRequest(BaseModel):
     ollama_model:    str = "deepseek-coder:1.3b"
     ollama_url:      str = "http://localhost:11434"
     ollama_timeout:  int = 120
-    # ── new: approach routing ──────────────────────────────────────────────
-    approach:        str = "hybrid"          # "pynguin" | "llm" | "hybrid"
+    approach:        str = "hybrid"
     selected_algos:  List[str] = ["RANDOM", "WHOLE_SUITE", "DYNAMOSA"]
     selected_models: List[str] = ["deepseek-coder:1.3b"]
     hybrid_algo:     str = "RANDOM"
@@ -609,7 +608,7 @@ def analyze_test_quality(test_code: str, source_code: Optional[str] = None) -> Q
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Ensemble Test Generator  (used by ZIP/codebase pipeline only)
+# Ensemble Test Generator
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ModelType(Enum):
@@ -898,7 +897,6 @@ def call_ollama(prompt: str, ollama_url: str, model: str, timeout: int) -> str:
 
 
 def _clean_code(raw: str) -> str:
-    """Strip markdown fences and leading noise from LLM output."""
     ansi = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
     raw = ansi.sub("", raw).strip()
     match = re.search(r"```python\s*\n(.*?)```", raw, re.DOTALL)
@@ -986,7 +984,6 @@ def _parse_refactor_response(raw, original):
 
 
 def fallback_simple_tests(code: str, module_name: str) -> str:
-    """Generate minimal fallback tests — always syntactically valid."""
     try:
         tree = ast.parse(code)
         functions = [node.name for node in ast.walk(tree)
@@ -1103,20 +1100,129 @@ def _parse_mutation_score(output: str) -> float:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ★  Coverage reading from Pynguin statistics.csv  (FIXED)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _read_pynguin_coverage(out_dir: str, work_dir: str, module_name: str) -> float:
+    """
+    Robustly read the branch/line coverage percentage that Pynguin writes to
+    statistics.csv.
+
+    Search order (most specific → broadest):
+      1. <out_dir>/statistics.csv              (Pynguin ≥ 0.35 default location)
+      2. <out_dir>/pynguin-report/statistics.csv
+      3. <work_dir>/statistics.csv
+      4. Walk the entire work_dir looking for any statistics.csv
+      5. Return 0.0 if nothing found
+
+    Column-name candidates tried (case-insensitive):
+      "Coverage", "BranchCoverage", "LineCoverage", "coverage_percent"
+    """
+    import csv as _csv
+
+    COVERAGE_COLS = [
+        "Coverage", "BranchCoverage", "LineCoverage",
+        "coverage_percent", "coverage", "branch_coverage", "line_coverage",
+    ]
+
+    candidate_paths: List[str] = [
+        os.path.join(out_dir, "statistics.csv"),
+        os.path.join(out_dir, "pynguin-report", "statistics.csv"),
+        os.path.join(work_dir, "statistics.csv"),
+        os.path.join(work_dir, "pynguin-report", "statistics.csv"),
+    ]
+
+    # Also walk the whole work_dir to catch wherever Pynguin drops the file
+    for root, dirs, files in os.walk(work_dir):
+        for fname in files:
+            if fname == "statistics.csv":
+                fp = os.path.join(root, fname)
+                if fp not in candidate_paths:
+                    candidate_paths.append(fp)
+
+    for csv_path in candidate_paths:
+        if not os.path.exists(csv_path):
+            continue
+        try:
+            with open(csv_path, newline="", encoding="utf-8") as fh:
+                raw = fh.read()
+
+            # Strip ANSI escape codes that Pynguin sometimes writes
+            ansi = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+            raw = ansi.sub("", raw)
+
+            reader = _csv.DictReader(io.StringIO(raw))
+            if not reader.fieldnames:
+                continue
+
+            # Build a case-insensitive field map
+            field_map = {f.strip().strip('"').lower(): f for f in reader.fieldnames}
+
+            # Find which coverage column exists
+            cov_col = None
+            for candidate in COVERAGE_COLS:
+                if candidate.lower() in field_map:
+                    cov_col = field_map[candidate.lower()]
+                    break
+
+            if cov_col is None:
+                # Last resort: any column with "coverage" in its name
+                for f in reader.fieldnames:
+                    if "coverage" in f.lower():
+                        cov_col = f
+                        break
+
+            if cov_col is None:
+                continue
+
+            # Find the best matching row for this module
+            rows = list(reader)
+            if not rows:
+                continue
+
+            # Try to match by TargetModule / module_name column
+            target_col = None
+            for f in reader.fieldnames:
+                if f.strip().strip('"').lower() in ("targetmodule", "module", "module_name", "target_module"):
+                    target_col = f
+                    break
+
+            matching_rows = rows  # default: use all rows
+            if target_col:
+                matched = [
+                    r for r in rows
+                    if r.get(target_col, "").strip().strip('"') == module_name
+                ]
+                if matched:
+                    matching_rows = matched
+
+            # Use the last row (most recent run)
+            row = matching_rows[-1]
+            raw_val = row.get(cov_col, "").strip().strip('"')
+            if not raw_val:
+                continue
+
+            val = float(raw_val)
+
+            # Pynguin may write the value as 0–1 fraction or 0–100 percentage
+            # Values > 1.0 are already percentages; ≤ 1.0 are fractions
+            if val <= 1.0:
+                return val          # already a fraction (0.0 – 1.0)
+            else:
+                return val / 100.0  # convert percentage to fraction
+
+        except Exception as exc:
+            print(f"[coverage] Failed to parse {csv_path}: {exc}")
+            continue
+
+    return 0.0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ★  Single-file Pynguin pipeline
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _pynguin_search_time(code: str) -> int:
-    """
-    Return an appropriate Pynguin search time (seconds) based on code size/complexity.
-    Simple functions get a short budget; complex modules get more time.
-
-    Heuristic bands:
-      ≤  5 branches / ≤ 20 LOC  →  10 s   (trivial)
-      ≤ 15 branches / ≤ 60 LOC  →  20 s   (simple)
-      ≤ 30 branches / ≤150 LOC  →  35 s   (moderate)
-      >  30 branches / > 150 LOC →  60 s   (complex)
-    """
     try:
         metrics = _analyze_code_complexity(code)
         branches = metrics.num_branches
@@ -1126,16 +1232,10 @@ def _pynguin_search_time(code: str) -> int:
         if branches <= 30 and loc <= 150: return 35
         return 60
     except Exception:
-        return 30  # safe default
+        return 30
 
 
 def _deduplicate_tests(raw_code: str) -> str:
-    """
-    Remove structurally duplicate test functions from Pynguin output.
-    Two tests are considered duplicates when their AST body is identical
-    (same assertions, same calls) regardless of variable names.
-    Keeps the first occurrence; preserves all imports and module-level code.
-    """
     try:
         tree = ast.parse(raw_code)
     except SyntaxError:
@@ -1149,10 +1249,9 @@ def _deduplicate_tests(raw_code: str) -> str:
             kept_nodes.append(node)
             continue
 
-        # Normalise: strip docstring, unparse body statements
         body_stmts = node.body
         if body_stmts and isinstance(body_stmts[0], ast.Expr) and isinstance(body_stmts[0].value, ast.Constant):
-            body_stmts = body_stmts[1:]  # skip docstring
+            body_stmts = body_stmts[1:]
 
         fingerprint = tuple(ast.unparse(s) for s in body_stmts)
         if fingerprint not in seen_bodies:
@@ -1188,7 +1287,6 @@ def _run_pynguin_algorithm(
     }
 
     try:
-        # Adaptive search budget based on code complexity
         _src = source_code or ""
         if not _src:
             try:
@@ -1233,28 +1331,34 @@ def _run_pynguin_algorithm(
             result["error"] = "Pynguin produced an empty test file"
             return result
 
-        # Remove structurally duplicate tests Pynguin tends to emit for simple code
         raw_tests = _deduplicate_tests(raw_tests)
 
         result["test_code"] = raw_tests
         result["num_tests"] = raw_tests.count("def test_")
         result["status"] = "success"
 
-        # ── Coverage: read from Pynguin statistics.csv ────────────────────
-        cov = 0.0
-        stats_csv = os.path.join(out_dir, "pynguin-report", "statistics.csv")
-        if os.path.exists(stats_csv):
+        # ── Coverage: use the robust multi-path reader ────────────────────
+        # Pass both out_dir (where Pynguin wrote) and work_dir (parent) so
+        # the reader can find statistics.csv wherever Pynguin placed it.
+        cov = _read_pynguin_coverage(out_dir, work_dir, module_name)
+
+        # ── Fallback: run pytest-cov if Pynguin stats gave 0 ─────────────
+        if cov == 0.0:
+            mdir = tempfile.mkdtemp(prefix=f"codexter_cov_{algorithm}_")
             try:
-                import csv as _csv
-                with open(stats_csv, newline="", encoding="utf-8") as _f:
-                    reader = _csv.DictReader(_f)
-                    rows = [r for r in reader
-                            if r.get("TargetModule", "").strip().strip('"') == module_name]
-                if rows:
-                    raw_cov = rows[-1].get("Coverage", "0").strip().strip('"')
-                    cov = float(raw_cov)
-            except Exception:
-                cov = 0.0
+                shutil.copy(src_path, os.path.join(mdir, f"{module_name}.py"))
+                open(os.path.join(mdir, "__init__.py"), "w").close()
+                test_dest = os.path.join(mdir, f"test_{module_name}_{algorithm.lower()}.py")
+                with open(test_dest, "w") as f:
+                    f.write(raw_tests)
+                cov, cov_logs = calculate_coverage(
+                    os.path.join(mdir, f"{module_name}.py"), test_dest, mdir
+                )
+                print(f"[coverage fallback] {algorithm}: {cov:.2%} — logs: {cov_logs}")
+            except Exception as cov_err:
+                print(f"[coverage fallback] {algorithm}: error — {cov_err}")
+            finally:
+                shutil.rmtree(mdir, ignore_errors=True)
 
         # ── Mutation score ────────────────────────────────────────────────
         mdir = tempfile.mkdtemp(prefix=f"codexter_{algorithm}_")
@@ -1292,10 +1396,6 @@ def _refine_tests_with_llm(
     model: str,
     timeout: int,
 ) -> dict:
-    """
-    Passes successful algo test outputs to the specified LLM for refinement.
-    Returns { status, refined_code, error }.
-    """
     successful = [r for r in algo_results if r["status"] == "success" and r["test_code"]]
     if not successful:
         return {"status": "error", "refined_code": None,
@@ -1354,8 +1454,6 @@ Start directly with `import pytest`."""
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ★  Single-file: Pynguin-only worker
-#    Runs only the user-selected algorithms (sequentially for determinism,
-#    but threaded internally — same as before).
 # ══════════════════════════════════════════════════════════════════════════════
 
 def process_single_file_pynguin(
@@ -1368,10 +1466,6 @@ def process_single_file_pynguin(
     timeout: int,
     selected_algos: Optional[List[str]] = None,
 ):
-    """
-    Pynguin-only approach: runs selected algorithms, computes coverage + mutation
-    for each, returns per-algorithm results (no LLM refinement step).
-    """
     algos = [a for a in PYNGUIN_ALGORITHMS if a in (selected_algos or PYNGUIN_ALGORITHMS)]
     if not algos:
         algos = PYNGUIN_ALGORITHMS
@@ -1408,14 +1502,12 @@ def process_single_file_pynguin(
                 done_count += 1
                 jobs[job_id]["progress"] = 10 + int((done_count / len(algos)) * 85)
 
-        # Sort in the canonical display order
         order = {a: i for i, a in enumerate(PYNGUIN_ALGORITHMS)}
         algo_results.sort(key=lambda r: order.get(r["algorithm"], 99))
 
         jobs[job_id]["algo_results"] = algo_results
         jobs[job_id]["progress"]     = 95
 
-        # Save per-algo test files and bundle ZIP
         saved_files = []
         for r in algo_results:
             if r["status"] == "success" and r["test_code"]:
@@ -1472,7 +1564,6 @@ def process_single_file_pynguin(
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ★  Single-file: LLM-only worker
-#    Runs selected LLM models sequentially, computes coverage + mutation each.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _run_llm_model_for_tests(
@@ -1483,10 +1574,6 @@ def _run_llm_model_for_tests(
     ollama_url: str,
     timeout: int,
 ) -> dict:
-    """
-    Generate tests with one LLM model and compute coverage + mutation score.
-    Returns a result dict in the same shape as a pynguin algo result.
-    """
     result: Dict[str, Any] = {
         "model":          model,
         "algorithm":      None,
@@ -1522,7 +1609,6 @@ def _run_llm_model_for_tests(
         result["num_tests"] = raw_tests.count("def test_")
         result["status"]    = "success"
 
-        # ── Compute coverage + mutation in an isolated temp dir ───────────
         mdir = tempfile.mkdtemp(prefix=f"codexter_llm_")
         try:
             shutil.copy(src_path, os.path.join(mdir, f"{module_name}.py"))
@@ -1557,10 +1643,6 @@ def process_single_file_llm(
     timeout: int,
     selected_models: Optional[List[str]] = None,
 ):
-    """
-    LLM-only approach: runs each selected model sequentially,
-    computes coverage + mutation for each, returns per-model results.
-    """
     models = [m for m in LLM_TEST_MODELS if m in (selected_models or LLM_TEST_MODELS)]
     if not models:
         models = ["deepseek-coder:1.3b"]
@@ -1589,7 +1671,6 @@ def process_single_file_llm(
             model_results.append(r)
             jobs[job_id]["progress"] = 5 + int((idx + 1) / len(models) * 85)
 
-        # Save files and bundle ZIP
         saved_files = []
         for r in model_results:
             if r["status"] == "success" and r["test_code"]:
@@ -1644,10 +1725,7 @@ def process_single_file_llm(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ★  Single-file: Hybrid worker  (one algo → mutation filter → one LLM refiner)
-#    Functionally identical to the old process_single_file_pynguin but:
-#      • runs only the one user-selected algorithm
-#      • uses the user-selected LLM model for refinement
+# ★  Single-file: Hybrid worker
 # ══════════════════════════════════════════════════════════════════════════════
 
 def process_single_file_hybrid(
@@ -1661,14 +1739,6 @@ def process_single_file_hybrid(
     hybrid_algo: str = "RANDOM",
     hybrid_llm: str = "deepseek-coder:1.3b",
 ):
-    """
-    Hybrid approach:
-      1. Run one Pynguin algorithm
-      2. Calculate coverage + mutation
-      3. Refine with one LLM
-    Returns results[] (the algo result) + refinement (the LLM-refined output).
-    """
-    # Validate algo choice
     if hybrid_algo not in PYNGUIN_ALGORITHMS:
         hybrid_algo = "RANDOM"
 
@@ -1683,7 +1753,6 @@ def process_single_file_hybrid(
             f.write(code)
         open(os.path.join(work_dir, "__init__.py"), "w").close()
 
-        # ── Phase 1: Pynguin ─────────────────────────────────────────────
         jobs[job_id]["phase_label"] = f"Running Pynguin/{hybrid_algo}…"
         jobs[job_id]["progress"]    = 10
 
@@ -1696,7 +1765,6 @@ def process_single_file_hybrid(
         jobs[job_id]["algo_results"] = [algo_result]
         jobs[job_id]["progress"]     = 60
 
-        # ── Phase 2: LLM refinement ───────────────────────────────────────
         jobs[job_id]["phase"]       = "refining"
         jobs[job_id]["phase_label"] = f"Refining with {hybrid_llm}…"
 
@@ -1711,7 +1779,6 @@ def process_single_file_hybrid(
         jobs[job_id]["progress"]   = 90
         jobs[job_id]["refinement"] = refinement
 
-        # ── Save files ────────────────────────────────────────────────────
         saved_files = []
 
         if algo_result["status"] == "success" and algo_result["test_code"]:
@@ -1773,7 +1840,7 @@ def process_single_file_hybrid(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Codebase (ZIP) pipeline helpers  — unchanged
+# Codebase (ZIP) pipeline helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_file_context(target_file: str, all_files: list) -> str:
@@ -1813,7 +1880,6 @@ def _process_one_file(
     job_id, code, module_name, file_path, ollama_url, model, timeout,
     context="", strategy="auto", force_ensemble=False,
 ) -> dict:
-    """Used by ZIP/codebase pipeline only — unchanged."""
     jobs[job_id]["current_file"] = f"{module_name}.py"
     work_dir = tempfile.mkdtemp(prefix="codexter_")
     entry: Dict[str, Any] = {"file": f"{module_name}.py", "status": "pending"}
@@ -1993,7 +2059,7 @@ def process_zip_job(job_id, zip_path, extract_path, model, ollama_url, timeout, 
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Code Quality Metrics  (used by refactor pipelines) — unchanged
+# Code Quality Metrics
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _pep8_count(code: str) -> int:
@@ -2109,7 +2175,7 @@ def compute_reward(before: dict, after: dict) -> float:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Multi-model refactor pipeline — unchanged
+# Multi-model refactor pipeline
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _refactor_one_model(
@@ -2133,16 +2199,6 @@ def _refactor_one_model(
                 result["error"] = f"Model '{model}' not found in Ollama. Run: ollama pull {model}"
                 result["elapsed"] = round(time.time() - t0, 2)
                 return result
-    except requests.exceptions.Timeout:
-        result["status"] = "error"
-        result["error"] = f"Cannot reach Ollama (tags check timed out)"
-        result["elapsed"] = round(time.time() - t0, 2)
-        return result
-    except requests.exceptions.ConnectionError:
-        result["status"] = "error"
-        result["error"] = f"Cannot connect to Ollama at {ollama_url}"
-        result["elapsed"] = round(time.time() - t0, 2)
-        return result
     except Exception as e:
         result["status"] = "error"
         result["error"] = f"Availability check failed: {type(e).__name__}: {e}"
@@ -2166,14 +2222,6 @@ def _refactor_one_model(
             "diff":            unified_diff_str(code, refactored, f"{module_name}.py"),
             "elapsed":         elapsed,
         })
-    except requests.exceptions.Timeout:
-        result["status"] = "error"
-        result["error"]  = f"Model '{model}' timed out after {timeout}s"
-        result["elapsed"] = round(time.time() - t0, 2)
-    except requests.exceptions.ConnectionError:
-        result["status"] = "error"
-        result["error"]  = f"Lost connection to Ollama during generation"
-        result["elapsed"] = round(time.time() - t0, 2)
     except Exception as e:
         result["status"]  = "error"
         result["error"]   = f"{type(e).__name__}: {e}"
@@ -2198,17 +2246,6 @@ def process_multimodel_refactor(
         for i, model in enumerate(REFACTOR_MODELS):
             jobs[job_id]["phase_label"] = f"Running {model} ({i+1}/{len(REFACTOR_MODELS)})…"
             jobs[job_id]["progress"] = int(i / len(REFACTOR_MODELS) * 100)
-
-            try:
-                requests.post(
-                    f"{ollama_url}/api/generate",
-                    json={"model": model, "prompt": "hi", "stream": False,
-                          "options": {"num_predict": 1}},
-                    timeout=120,
-                )
-            except Exception:
-                pass
-
             result = _refactor_one_model(code, module_name, model, ollama_url, timeout, before)
             model_results.append(result)
             jobs[job_id]["progress"] = int((i + 1) / len(REFACTOR_MODELS) * 100)
@@ -2230,7 +2267,7 @@ def process_multimodel_refactor(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Simulated-PPO refactor pipeline — unchanged
+# Simulated-PPO refactor pipeline
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _ppo_feedback_prompt(
@@ -2391,34 +2428,19 @@ def process_ppo_refactor(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ★  NEW APPROACH 1 — AST Rule-Engine Refactor
-#    Deterministic, zero-LLM transformations driven by Python's ast module.
-#    Rules applied (each is an independent AST visitor pass):
-#      R1  Extract functions longer than MAX_FUNC_LINES into helpers
-#      R2  Remove unused imports
-#      R3  Inline single-use variables that are only ever assigned once
-#      R4  Replace bare `except:` with `except Exception:`
-#      R5  Add missing type-hint stubs to function signatures
-#      R6  Deduplicate consecutive identical statements
-#      R7  Simplify `if x == True/False` → `if x / if not x`
-#      R8  Add module-level docstring when absent
+# AST Rule-Engine Refactor
 # ══════════════════════════════════════════════════════════════════════════════
 
-MAX_FUNC_LINES = 30   # functions longer than this get flagged for extraction
-
+MAX_FUNC_LINES = 30
 
 class _UnusedImportRemover(ast.NodeTransformer):
-    """Remove import statements whose names are never referenced in the module."""
-
     def __init__(self, tree: ast.Module):
-        # Collect every Name/Attribute string used outside import lines
         self._used: Set[str] = set()
         for node in ast.walk(tree):
             if isinstance(node, ast.Name):
                 self._used.add(node.id)
             elif isinstance(node, ast.Attribute):
                 self._used.add(node.attr)
-        # also keep names referenced as string annotations
         for node in ast.walk(tree):
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
                 self._used.add(node.value)
@@ -2442,9 +2464,6 @@ class _UnusedImportRemover(ast.NodeTransformer):
 
 
 class _BoolSimplifier(ast.NodeTransformer):
-    """Replace `x == True` → `x`,  `x == False` → `not x`,
-       `if x == True:` → `if x:`,  etc."""
-
     def visit_Compare(self, node: ast.Compare) -> ast.expr:
         if (len(node.ops) == 1 and isinstance(node.ops[0], ast.Eq)
                 and len(node.comparators) == 1):
@@ -2458,8 +2477,6 @@ class _BoolSimplifier(ast.NodeTransformer):
 
 
 class _BareExceptFixer(ast.NodeTransformer):
-    """Replace `except:` with `except Exception:`."""
-
     def visit_ExceptHandler(self, node: ast.ExceptHandler) -> ast.ExceptHandler:
         if node.type is None:
             node.type = ast.Name(id="Exception", ctx=ast.Load())
@@ -2467,7 +2484,6 @@ class _BareExceptFixer(ast.NodeTransformer):
 
 
 def _add_module_docstring(tree: ast.Module, module_name: str) -> ast.Module:
-    """Prepend a minimal module docstring when the module lacks one."""
     has_doc = (tree.body
                and isinstance(tree.body[0], ast.Expr)
                and isinstance(tree.body[0].value, ast.Constant)
@@ -2479,7 +2495,6 @@ def _add_module_docstring(tree: ast.Module, module_name: str) -> ast.Module:
 
 
 def _add_missing_type_hints(tree: ast.Module) -> ast.Module:
-    """Add `-> None` return annotation to functions that have none."""
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.returns is None:
             if node.name != "__init__":
@@ -2488,7 +2503,6 @@ def _add_missing_type_hints(tree: ast.Module) -> ast.Module:
 
 
 def _report_long_functions(tree: ast.Module) -> List[str]:
-    """Return names of functions that exceed MAX_FUNC_LINES (advisory only)."""
     long_fns = []
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -2499,7 +2513,6 @@ def _report_long_functions(tree: ast.Module) -> List[str]:
 
 
 def _deduplicate_consecutive_stmts(tree: ast.Module) -> ast.Module:
-    """Remove back-to-back identical statements in function bodies."""
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
             new_body = []
@@ -2518,17 +2531,12 @@ def _deduplicate_consecutive_stmts(tree: ast.Module) -> ast.Module:
 
 
 def apply_ast_rules(code: str, module_name: str) -> Tuple[str, List[str]]:
-    """
-    Apply all AST rule passes to *code* and return (refactored_code, change_log).
-    Falls back to original code on any parse error.
-    """
     changes: List[str] = []
     try:
         tree = ast.parse(code)
     except SyntaxError as exc:
         return code, [f"SyntaxError — cannot parse: {exc}"]
 
-    # R8 — module docstring
     original_has_doc = (tree.body
                         and isinstance(tree.body[0], ast.Expr)
                         and isinstance(tree.body[0].value, ast.Constant))
@@ -2536,7 +2544,6 @@ def apply_ast_rules(code: str, module_name: str) -> Tuple[str, List[str]]:
     if not original_has_doc:
         changes.append("R8: Added module-level docstring")
 
-    # R2 — remove unused imports
     before_imports = sum(1 for n in tree.body
                          if isinstance(n, (ast.Import, ast.ImportFrom)))
     tree = _UnusedImportRemover(tree).visit(tree)
@@ -2546,23 +2553,18 @@ def apply_ast_rules(code: str, module_name: str) -> Tuple[str, List[str]]:
     if removed:
         changes.append(f"R2: Removed {removed} unused import statement(s)")
 
-    # R7 — bool simplification
     tree = _BoolSimplifier().visit(tree)
     changes.append("R7: Simplified boolean comparisons (x==True → x)")
 
-    # R4 — bare except
     tree = _BareExceptFixer().visit(tree)
     changes.append("R4: Replaced bare except: with except Exception:")
 
-    # R6 — deduplicate consecutive statements
     tree = _deduplicate_consecutive_stmts(tree)
     changes.append("R6: Removed consecutive duplicate statements")
 
-    # R5 — type hint stubs
     tree = _add_missing_type_hints(tree)
     changes.append("R5: Added missing -> None return annotations")
 
-    # R1 — advisory long-function report (no auto-extraction to preserve semantics)
     long_fns = _report_long_functions(tree)
     if long_fns:
         changes.append(
@@ -2573,7 +2575,6 @@ def apply_ast_rules(code: str, module_name: str) -> Tuple[str, List[str]]:
     ast.fix_missing_locations(tree)
     try:
         refactored = ast.unparse(tree)
-        # ast.unparse collapses whitespace; reformat with black if available
         try:
             import black
             mode = black.Mode(line_length=88)
@@ -2589,10 +2590,8 @@ def apply_ast_rules(code: str, module_name: str) -> Tuple[str, List[str]]:
 
 def process_ast_refactor(
     job_id: str, code: str, module_name: str,
-    ollama_url: str = "http://localhost:11434",
-    timeout: int = 300,
+    ollama_url: str, timeout: int,
 ) -> None:
-    """Background worker for the AST rule-engine refactor job."""
     jobs[job_id].update({
         "status": "processing", "progress": 0,
         "phase": "ast", "phase_label": "Applying AST rule passes…",
@@ -2620,850 +2619,15 @@ def process_ast_refactor(
             "phase":           "done",
             "phase_label":     "AST refactor complete",
             "refactored_code": refactored,
-            "before_metrics":  before,
-            "after_metrics":   after,
-            "delta":           delta,
-            "reward":          round(reward, 4),
-            "diff":            diff,
-            "changes":         changes,
-            "summary":         "\n".join(f"• {c}" for c in changes),
-            "message":         f"AST refactor complete — {len(changes)} rule(s) applied",
-        })
-    except Exception as exc:
-        jobs[job_id]["status"] = "error"
-        jobs[job_id]["error"]  = str(exc)
-        print(traceback.format_exc())
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ★  NEW APPROACH 2 — Simulated Annealing Refactor
-#    Treats each atomic refactoring action as a "move" in SA's search space.
-#    The energy function is the inverse of our existing reward function so
-#    lower energy  ==  better code.
-#
-#    Move catalogue (applied stochastically each SA step):
-#      M1  Rename single-letter variables to descriptive names (LLM-assisted)
-#      M2  Extract the longest function body into a helper (LLM-assisted)
-#      M3  Fix PEP 8 style issues (black / autopep8)
-#      M4  Add/improve docstrings (LLM-assisted)
-#      M5  Simplify boolean expressions (AST rule)
-#      M6  Remove dead assignments (AST rule)
-#
-#    Temperature schedule: geometric cooling  T(k) = T0 * alpha^k
-# ══════════════════════════════════════════════════════════════════════════════
-
-SA_T0        = 1.0    # initial temperature
-SA_ALPHA     = 0.80   # cooling rate
-SA_MAX_STEPS = 12     # total SA steps (kept modest for LLM budget)
-SA_MIN_TEMP  = 0.05   # stop early when temperature drops below this
-
-
-def _sa_energy(before: dict, current_code: str) -> float:
-    """Lower energy == better code.  Energy = 1 - normalised_reward (range 0–2)."""
-    after  = compute_code_metrics(current_code)
-    reward = compute_reward(before, after)      # reward in [-1, 1]
-    return 1.0 - reward                         # energy in [0, 2]
-
-
-def _sa_move_pep8(code: str) -> Tuple[str, str]:
-    """M3: Apply autopep8 formatting (no LLM)."""
-    try:
-        import autopep8
-        fixed = autopep8.fix_code(code, options={"aggressive": 1, "max_line_length": 88})
-        return fixed, "M3: Applied autopep8 PEP 8 fixes"
-    except ImportError:
-        pass
-    # fallback: black
-    try:
-        import black
-        fixed = black.format_str(code, mode=black.Mode(line_length=88))
-        return fixed, "M3: Formatted with black"
-    except Exception:
-        return code, "M3: No formatter available (install autopep8 or black)"
-
-
-def _sa_move_bool_simplify(code: str) -> Tuple[str, str]:
-    """M5: Simplify boolean comparisons via AST."""
-    try:
-        tree = ast.parse(code)
-        tree = _BoolSimplifier().visit(tree)
-        ast.fix_missing_locations(tree)
-        return ast.unparse(tree), "M5: Simplified boolean comparisons"
-    except Exception:
-        return code, "M5: Bool simplification skipped (parse error)"
-
-
-def _sa_move_llm(
-    code: str, module_name: str,
-    move_id: str, instruction: str,
-    ollama_url: str, model: str, timeout: int,
-) -> Tuple[str, str]:
-    """Generic LLM-assisted SA move: send a targeted instruction."""
-    prompt = f"""You are a Python refactoring assistant applying one specific improvement.
-
-Module: {module_name}
-
-Instruction (apply ONLY this change, nothing else):
-{instruction}
-
-Current code:
-```python
-{code}
-```
-
-Return ONLY the complete modified Python file. No markdown fences. No explanations.
-Start directly with the first import or statement."""
-    try:
-        raw      = call_ollama(prompt, ollama_url, model, timeout)
-        improved = _clean_code(raw)
-        ast.parse(improved)          # validate syntax
-        return improved, f"{move_id}: {instruction[:80]}"
-    except Exception as exc:
-        return code, f"{move_id}: skipped ({exc})"
-
-
-def process_sa_refactor(
-    job_id: str, code: str, module_name: str,
-    ollama_url: str, model: str, timeout: int,
-    t0: float  = SA_T0,
-    alpha: float = SA_ALPHA,
-    max_steps: int = SA_MAX_STEPS,
-) -> None:
-    """Background worker for the Simulated Annealing refactor job."""
-    import math, random
-
-    jobs[job_id].update({
-        "status": "processing", "progress": 0,
-        "phase": "sa", "phase_label": "Initialising SA…",
-        "iterations": [],
-    })
-    before      = compute_code_metrics(code)
-    jobs[job_id]["before_metrics"] = before
-
-    current     = code
-    current_e   = _sa_energy(before, current)
-    best_code   = current
-    best_energy = current_e
-    temp        = t0
-    log: List[dict] = []
-
-    # Move catalogue — (id, callable) pairs; LLM moves carry extra args
-    def _make_moves(c: str):
-        return [
-            ("M3", lambda: _sa_move_pep8(c)),
-            ("M5", lambda: _sa_move_bool_simplify(c)),
-            ("M1", lambda: _sa_move_llm(
-                c, module_name, "M1",
-                "Rename all single-letter variables (except loop indices i/j/k) "
-                "to short but descriptive names that reflect their purpose.",
-                ollama_url, model, timeout // 2)),
-            ("M4", lambda: _sa_move_llm(
-                c, module_name, "M4",
-                "Add a concise one-line docstring to every function and class "
-                "that currently lacks one.  Do not change any logic.",
-                ollama_url, model, timeout // 2)),
-            ("M2", lambda: _sa_move_llm(
-                c, module_name, "M2",
-                f"Find the single longest function (if any exceeds {MAX_FUNC_LINES} lines) "
-                "and extract its largest cohesive block into a private helper function. "
-                "Do not change external behaviour.",
-                ollama_url, model, timeout // 2)),
-            ("M6", lambda: _sa_move_llm(
-                c, module_name, "M6",
-                "Remove any variables that are assigned but never read afterwards. "
-                "Do not change any other logic.",
-                ollama_url, model, timeout // 2)),
-        ]
-
-    try:
-        for step in range(1, max_steps + 1):
-            if temp < SA_MIN_TEMP:
-                jobs[job_id]["phase_label"] = f"SA cooled at step {step} (T={temp:.3f})"
-                break
-
-            pct = int((step - 1) / max_steps * 90)
-            jobs[job_id].update({
-                "phase_label": f"SA step {step}/{max_steps} — T={temp:.3f}",
-                "progress":    pct,
-            })
-
-            # Pick a random move weighted toward cheap ones early
-            moves = _make_moves(current)
-            move_id, move_fn = random.choice(moves)
-
-            candidate, move_desc = move_fn()
-            candidate_e = _sa_energy(before, candidate)
-
-            delta_e = candidate_e - current_e
-            if delta_e < 0:
-                accept = True
-            else:
-                accept = random.random() < math.exp(-delta_e / max(temp, 1e-9))
-
-            after_metrics = compute_code_metrics(candidate if accept else current)
-            reward = compute_reward(before, after_metrics)
-
-            entry = {
-                "step":      step,
-                "temp":      round(temp, 4),
-                "move":      move_desc,
-                "energy":    round(candidate_e, 4),
-                "delta_e":   round(delta_e, 4),
-                "accepted":  accept,
-                "reward":    round(reward, 4),
-                "delta":     metrics_delta(before, after_metrics),
-                "code":      candidate if accept else current,
-            }
-            log.append(entry)
-            jobs[job_id]["iterations"] = log[:]
-
-            if accept:
-                current   = candidate
-                current_e = candidate_e
-
-            if candidate_e < best_energy:
-                best_energy = candidate_e
-                best_code   = candidate
-
-            temp *= alpha
-
-        fa    = compute_code_metrics(best_code)
-        fd    = metrics_delta(before, fa)
-        fr    = compute_reward(before, fa)
-        fdiff = unified_diff_str(code, best_code, f"{module_name}.py")
-
-        jobs[job_id].update({
-            "status":           "completed",
-            "progress":         100,
-            "phase":            "done",
-            "phase_label":      "SA refactor complete",
-            "best_code":        best_code,
-            "best_energy":      round(best_energy, 4),
-            "best_reward":      round(fr, 4),
-            "final_after":      fa,
-            "final_delta":      fd,
-            "final_diff":       fdiff,
-            "total_steps":      len(log),
-            "message":          (
-                f"SA complete — {len(log)} step(s), "
-                f"best reward {fr:.3f}, final T={temp:.3f}"
-            ),
-        })
-    except Exception as exc:
-        jobs[job_id]["status"] = "error"
-        jobs[job_id]["error"]  = str(exc)
-        print(traceback.format_exc())
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ★  NEW APPROACH 3 — RAG-based Refactor
-#    Retrieves structurally similar code patterns from a local vector store
-#    built from the project's own codebase (or seed examples), then uses
-#    those as few-shot examples in the LLM refactoring prompt.
-#
-#    Vector store backend: chromadb (in-process, no server required).
-#    Embedding: sentence-transformers "all-MiniLM-L6-v2" (CPU-friendly, ~80 MB).
-#    Falls back gracefully to AST-similarity retrieval when chromadb / torch
-#    are not installed (no hard dependency added).
-#
-#    Pipeline per job:
-#      1. Parse the target file into function-level chunks
-#      2. Query the store for the k most similar chunks
-#      3. Build a few-shot prompt: retrieved examples + target code
-#      4. Call the Ollama LLM with the enriched prompt
-#      5. Score + store result (same metrics as other approaches)
-# ══════════════════════════════════════════════════════════════════════════════
-
-RAG_TOP_K          = 3     # number of similar examples to retrieve
-RAG_CHUNK_MIN_LINES = 3    # minimum lines for a chunk to be indexed
-RAG_COLLECTION     = "codexter_rag"
-
-# Seed examples of clean Python patterns used when the store is empty
-_RAG_SEED_EXAMPLES: List[dict] = [
-    {
-        "id": "seed_type_hints",
-        "code": (
-            "def add(a: int, b: int) -> int:\n"
-            "    \"\"\"Return the sum of two integers.\"\"\"\n"
-            "    return a + b\n"
-        ),
-        "description": "well-typed simple function with docstring",
-    },
-    {
-        "id": "seed_guard",
-        "code": (
-            "def safe_divide(numerator: float, denominator: float) -> float:\n"
-            "    \"\"\"Divide numerator by denominator; raise ValueError on zero.\"\"\"\n"
-            "    if denominator == 0:\n"
-            "        raise ValueError('denominator must not be zero')\n"
-            "    return numerator / denominator\n"
-        ),
-        "description": "guard clause pattern with exception",
-    },
-    {
-        "id": "seed_dataclass",
-        "code": (
-            "from dataclasses import dataclass\n\n"
-            "@dataclass\n"
-            "class Point:\n"
-            "    \"\"\"Immutable 2-D point.\"\"\"\n"
-            "    x: float\n"
-            "    y: float\n\n"
-            "    def distance_to(self, other: 'Point') -> float:\n"
-            "        \"\"\"Return Euclidean distance to another Point.\"\"\"\n"
-            "        return ((self.x - other.x) ** 2 + (self.y - other.y) ** 2) ** 0.5\n"
-        ),
-        "description": "dataclass with method and type annotations",
-    },
-    {
-        "id": "seed_context_manager",
-        "code": (
-            "from contextlib import contextmanager\n\n"
-            "@contextmanager\n"
-            "def managed_resource(path: str):\n"
-            "    \"\"\"Open path as a resource and ensure it is closed.\"\"\"\n"
-            "    resource = open(path)\n"
-            "    try:\n"
-            "        yield resource\n"
-            "    finally:\n"
-            "        resource.close()\n"
-        ),
-        "description": "context manager with proper resource cleanup",
-    },
-    {
-        "id": "seed_list_comp",
-        "code": (
-            "def filter_positive(numbers: list[float]) -> list[float]:\n"
-            "    \"\"\"Return only the positive values from numbers.\"\"\"\n"
-            "    return [n for n in numbers if n > 0]\n"
-        ),
-        "description": "idiomatic list comprehension replacing explicit loop",
-    },
-]
-
-
-def _extract_function_chunks(code: str) -> List[dict]:
-    """Split *code* into per-function/class chunks for indexing."""
-    chunks: List[dict] = []
-    try:
-        tree = ast.parse(code)
-        lines = code.splitlines()
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                start = node.lineno - 1
-                end   = getattr(node, "end_lineno", start + 1)
-                chunk_lines = lines[start:end]
-                if len(chunk_lines) >= RAG_CHUNK_MIN_LINES:
-                    chunks.append({
-                        "id":   f"chunk_{node.name}_{start}",
-                        "name": node.name,
-                        "code": "\n".join(chunk_lines),
-                        "kind": type(node).__name__,
-                    })
-    except Exception:
-        pass
-    if not chunks and len(code.splitlines()) >= RAG_CHUNK_MIN_LINES:
-        chunks.append({"id": "chunk_full", "name": "module", "code": code, "kind": "Module"})
-    return chunks
-
-
-def _rag_get_client():
-    """Return a chromadb in-process client, or None if not installed."""
-    try:
-        import chromadb
-        client = chromadb.Client()
-        return client
-    except ImportError:
-        return None
-
-
-def _rag_get_embedding_fn():
-    """Return a sentence-transformers embedding function, or a simple TF-IDF fallback."""
-    try:
-        from chromadb.utils import embedding_functions
-        return embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name="all-MiniLM-L6-v2"
-        )
-    except Exception:
-        return None
-
-
-def _ast_similarity(a: str, b: str) -> float:
-    """Rough AST-token similarity when embeddings unavailable (0..1)."""
-    try:
-        ta = set(type(n).__name__ for n in ast.walk(ast.parse(a)))
-        tb = set(type(n).__name__ for n in ast.walk(ast.parse(b)))
-        if not ta or not tb:
-            return 0.0
-        return len(ta & tb) / len(ta | tb)
-    except Exception:
-        return 0.0
-
-
-def _rag_retrieve_similar(
-    query_code: str,
-    seed_examples: List[dict],
-    project_chunks: List[dict],
-    top_k: int = RAG_TOP_K,
-    chroma_client=None,
-    embed_fn=None,
-) -> List[dict]:
-    """
-    Return the top-k most similar code snippets to query_code.
-    Uses chromadb + sentence-transformers when available;
-    falls back to AST-token Jaccard similarity.
-    """
-    all_docs = seed_examples + project_chunks
-
-    if chroma_client is not None and embed_fn is not None:
-        try:
-            col = chroma_client.get_or_create_collection(
-                name=RAG_COLLECTION,
-                embedding_function=embed_fn,
-            )
-            # Upsert documents not yet in the collection
-            existing_ids = set(col.get()["ids"])
-            to_add = [d for d in all_docs if d["id"] not in existing_ids]
-            if to_add:
-                col.upsert(
-                    ids=[d["id"] for d in to_add],
-                    documents=[d["code"] for d in to_add],
-                    metadatas=[{"description": d.get("description", d.get("name", ""))}
-                               for d in to_add],
-                )
-            results = col.query(query_texts=[query_code], n_results=min(top_k, len(all_docs)))
-            retrieved = []
-            for doc, meta in zip(
-                results["documents"][0], results["metadatas"][0]
-            ):
-                retrieved.append({"code": doc, "description": meta.get("description", "")})
-            return retrieved
-        except Exception:
-            pass  # fall through to AST fallback
-
-    # AST Jaccard fallback
-    scored = [(d, _ast_similarity(query_code, d["code"])) for d in all_docs]
-    scored.sort(key=lambda x: x[1], reverse=True)
-    return [
-        {"code": d["code"], "description": d.get("description", d.get("name", ""))}
-        for d, _ in scored[:top_k]
-    ]
-
-
-def _build_rag_prompt(
-    target_code: str,
-    module_name: str,
-    retrieved: List[dict],
-) -> str:
-    """Assemble a few-shot refactoring prompt from retrieved examples."""
-    examples_block = "\n\n".join(
-        f"# Example {i+1} — {ex['description']}\n"
-        f"```python\n{ex['code']}\n```"
-        for i, ex in enumerate(retrieved)
-    )
-    return f"""You are an expert Python refactoring engineer.
-Study the following examples of well-written Python code patterns, then apply
-the same quality standards to refactor the target module.
-
-━━ Retrieved similar patterns (use as style reference) ━━
-{examples_block}
-
-━━ Target module to refactor: {module_name} ━━
-```python
-{target_code}
-```
-
-Apply the style and quality patterns demonstrated in the examples above.
-Focus on:
-1. Consistent type annotations (as shown in examples)
-2. Concise, single-line docstrings on all public functions/classes
-3. Guard clauses instead of deeply nested conditions
-4. Idiomatic Python (list comprehensions, context managers, dataclasses where fitting)
-5. PEP 8 compliance
-
-Respond in exactly two sections:
-
-REFACTORED_CODE:
-```python
-<complete refactored module>
-```
-
-SUMMARY:
-<bullet list of specific improvements made, referencing example patterns used>"""
-
-
-def process_rag_refactor(
-    job_id: str, code: str, module_name: str,
-    ollama_url: str, model: str, timeout: int,
-    extra_project_files: Optional[List[str]] = None,
-) -> None:
-    """Background worker for the RAG-based refactor job."""
-    jobs[job_id].update({
-        "status": "processing", "progress": 0,
-        "phase": "rag", "phase_label": "Building vector store…",
-    })
-    before = compute_code_metrics(code)
-    jobs[job_id]["before_metrics"] = before
-
-    try:
-        # ── Step 1: Extract project chunks from extra files (if any) ─────────
-        jobs[job_id]["progress"] = 10
-        project_chunks: List[dict] = []
-        if extra_project_files:
-            for fp in (extra_project_files or []):
-                try:
-                    with open(fp, "r", encoding="utf-8") as fh:
-                        fc = fh.read()
-                    for chunk in _extract_function_chunks(fc):
-                        chunk["id"] = f"proj_{os.path.basename(fp)}_{chunk['id']}"
-                        project_chunks.append(chunk)
-                except Exception:
-                    pass
-
-        # Also chunk the target file itself so similar internal functions
-        # can be retrieved as style references
-        for chunk in _extract_function_chunks(code):
-            chunk["id"] = f"self_{chunk['id']}"
-            project_chunks.append(chunk)
-
-        # ── Step 2: Set up vector store ───────────────────────────────────────
-        jobs[job_id]["progress"] = 25
-        jobs[job_id]["phase_label"] = "Retrieving similar patterns…"
-        chroma_client = _rag_get_client()
-        embed_fn      = _rag_get_embedding_fn() if chroma_client else None
-
-        # ── Step 3: Retrieve top-k similar snippets ───────────────────────────
-        retrieved = _rag_retrieve_similar(
-            query_code=code,
-            seed_examples=[{
-                "id":          ex["id"],
-                "code":        ex["code"],
-                "description": ex["description"],
-                "name":        ex["id"],
-            } for ex in _RAG_SEED_EXAMPLES],
-            project_chunks=project_chunks,
-            top_k=RAG_TOP_K,
-            chroma_client=chroma_client,
-            embed_fn=embed_fn,
-        )
-        jobs[job_id]["progress"]    = 45
-        jobs[job_id]["phase_label"] = f"Refactoring with {len(retrieved)} retrieved examples…"
-        jobs[job_id]["retrieved_examples"] = [
-            {"description": r["description"], "preview": r["code"][:200]}
-            for r in retrieved
-        ]
-
-        # ── Step 4: Build prompt + call LLM ──────────────────────────────────
-        prompt   = _build_rag_prompt(code, module_name, retrieved)
-        raw      = call_ollama(prompt, ollama_url, model, timeout)
-        refactored, summary = _parse_refactor_response(raw, code)
-
-        jobs[job_id]["progress"]    = 85
-        jobs[job_id]["phase_label"] = "Computing metrics…"
-
-        # ── Step 5: Score result ──────────────────────────────────────────────
-        after  = compute_code_metrics(refactored)
-        delta  = metrics_delta(before, after)
-        reward = compute_reward(before, after)
-        diff   = unified_diff_str(code, refactored, f"{module_name}.py")
-
-        embedding_backend = (
-            "chromadb + sentence-transformers"
-            if (chroma_client and embed_fn) else "AST-token Jaccard fallback"
-        )
-
-        jobs[job_id].update({
-            "status":              "completed",
-            "progress":            100,
-            "phase":               "done",
-            "phase_label":         "RAG refactor complete",
-            "refactored_code":     refactored,
-            "after_metrics":       after,
-            "delta":               delta,
-            "reward":              round(reward, 4),
-            "diff":                diff,
-            "summary":             summary,
-            "embedding_backend":   embedding_backend,
-            "num_examples_used":   len(retrieved),
-            "message": (
-                f"RAG refactor complete — {len(retrieved)} example(s) retrieved "
-                f"via {embedding_backend}, reward {reward:.3f}"
-            ),
-        })
-    except Exception as exc:
-        jobs[job_id]["status"] = "error"
-        jobs[job_id]["error"]  = str(exc)
-        print(traceback.format_exc())
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ★  NEW APPROACH 1 — AST Rule-Engine Refactor
-#    Deterministic, zero-LLM, pure Python AST transforms:
-#      • Extract long functions (> AST_MAX_FUNC_LINES lines) into helpers
-#      • Remove dead / unreachable code after return/raise/continue/break
-#      • Inline single-use, simple-expression variables
-#      • Flatten redundant single-branch if/else (if cond: return True else: return False)
-#      • Insert missing type-hints on simple numeric/str/bool return functions
-#      • Ensure every public function has at least a one-line docstring
-# ══════════════════════════════════════════════════════════════════════════════
-
-AST_MAX_FUNC_LINES = 30   # functions longer than this are candidates for extraction
-
-
-class _ASTRuleEngine(ast.NodeTransformer):
-    """
-    Applies a set of deterministic AST transformations and tracks a change log.
-    All transforms are conservative — they will not break syntactically valid code.
-    """
-
-    def __init__(self, module_name: str = "module"):
-        self.module_name  = module_name
-        self.change_log: List[str] = []
-        self._helper_funcs: List[ast.FunctionDef] = []
-        self._helper_counter = 0
-
-    # ── helper: make a short identifier safe for use as a function name ──────
-    @staticmethod
-    def _safe_id(name: str) -> str:
-        return re.sub(r"[^a-z0-9_]", "_", name.lower())
-
-    # ── Remove dead code after terminal statements ────────────────────────────
-    def _trim_dead_stmts(self, stmts: list) -> list:
-        trimmed = []
-        for stmt in stmts:
-            trimmed.append(stmt)
-            if isinstance(stmt, (ast.Return, ast.Raise, ast.Continue, ast.Break)):
-                break
-        if len(trimmed) < len(stmts):
-            removed = len(stmts) - len(trimmed)
-            self.change_log.append(
-                f"Removed {removed} unreachable statement(s) after terminal statement"
-            )
-        return trimmed
-
-    def visit_FunctionDef(self, node: ast.FunctionDef):
-        self.generic_visit(node)
-
-        # 1. Trim dead statements in function body
-        node.body = self._trim_dead_stmts(node.body)
-
-        # 2. Add missing docstring to public functions
-        has_doc = (
-            node.body
-            and isinstance(node.body[0], ast.Expr)
-            and isinstance(node.body[0].value, ast.Constant)
-            and isinstance(node.body[0].value.value, str)
-        )
-        if not has_doc and not node.name.startswith("_"):
-            doc_node = ast.Expr(
-                value=ast.Constant(value=f"Handle {node.name.replace('_', ' ')}.")
-            )
-            node.body.insert(0, doc_node)
-            self.change_log.append(f"Added docstring to `{node.name}`")
-
-        # 3. Flatten redundant bool returns:  if cond: return True \n else: return False
-        #    → return bool(cond)
-        new_body: List[ast.stmt] = []
-        i = 0
-        while i < len(node.body):
-            stmt = node.body[i]
-            flattened = self._try_flatten_bool_return(stmt)
-            new_body.append(flattened if flattened is not None else stmt)
-            if flattened is not None:
-                self.change_log.append(
-                    f"Flattened redundant bool return in `{node.name}`"
-                )
-            i += 1
-        node.body = new_body
-
-        # 4. Extract oversized function into helper(s)
-        body_lines = sum(
-            1 for s in node.body
-            if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant))
-        )
-        if body_lines > AST_MAX_FUNC_LINES and len(node.body) > 5:
-            node = self._extract_long_function(node)
-
-        return node
-
-    visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
-
-    # ── Flatten: if cond: return True / else: return False → return bool(cond) ─
-    @staticmethod
-    def _try_flatten_bool_return(stmt: ast.stmt) -> Optional[ast.stmt]:
-        if not isinstance(stmt, ast.If):
-            return None
-        if len(stmt.body) != 1 or len(stmt.orelse) != 1:
-            return None
-        then_s, else_s = stmt.body[0], stmt.orelse[0]
-        if not (isinstance(then_s, ast.Return) and isinstance(else_s, ast.Return)):
-            return None
-        tv = then_s.value; ev = else_s.value
-        if not (isinstance(tv, ast.Constant) and isinstance(ev, ast.Constant)):
-            return None
-        if (tv.value, ev.value) == (True, False):
-            return ast.Return(
-                value=ast.Call(
-                    func=ast.Name(id="bool", ctx=ast.Load()),
-                    args=[stmt.test], keywords=[],
-                )
-            )
-        if (tv.value, ev.value) == (False, True):
-            return ast.Return(
-                value=ast.Call(
-                    func=ast.Name(id="bool", ctx=ast.Load()),
-                    args=[ast.UnaryOp(op=ast.Not(), operand=stmt.test)],
-                    keywords=[],
-                )
-            )
-        return None
-
-    # ── Extract oversized function body into a private helper ─────────────────
-    def _extract_long_function(self, node: ast.FunctionDef) -> ast.FunctionDef:
-        mid = len(node.body) // 2
-        extracted_stmts = node.body[mid:]
-
-        # Collect names assigned in the extracted block
-        assigned: List[str] = []
-        for s in extracted_stmts:
-            if isinstance(s, ast.Assign):
-                for t in s.targets:
-                    if isinstance(t, ast.Name):
-                        assigned.append(t.id)
-
-        self._helper_counter += 1
-        helper_name = f"_{self._safe_id(node.name)}_part{self._helper_counter}"
-
-        # Build helper args from names used-but-not-assigned in extracted block
-        used: set = set()
-        for s in extracted_stmts:
-            for n in ast.walk(s):
-                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
-                    used.add(n.id)
-        args_needed = [
-            ast.arg(arg=n)
-            for n in sorted(used - set(assigned))
-            if n not in ("self", "cls", "True", "False", "None")
-        ]
-
-        helper = ast.FunctionDef(
-            name=helper_name,
-            args=ast.arguments(
-                posonlyargs=[], args=args_needed, vararg=None,
-                kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[],
-            ),
-            body=[
-                ast.Expr(value=ast.Constant(value=f"Helper extracted from `{node.name}`.")),
-                *extracted_stmts,
-            ],
-            decorator_list=[],
-            returns=None,
-            lineno=0, col_offset=0,
-        )
-        ast.fix_missing_locations(helper)
-        self._helper_funcs.append(helper)
-
-        # Replace extracted stmts with a call to the helper
-        call = ast.Expr(
-            value=ast.Call(
-                func=ast.Name(id=helper_name, ctx=ast.Load()),
-                args=[ast.Name(id=a.arg, ctx=ast.Load()) for a in args_needed],
-                keywords=[],
-            )
-        )
-        ast.fix_missing_locations(call)
-        node.body = node.body[:mid] + [call]
-        self.change_log.append(
-            f"Extracted lower half of `{node.name}` into `{helper_name}`"
-        )
-        return node
-
-    # ── Inline single-use, simple-expression variables ─────────────────────────
-    def visit_Module(self, node: ast.Module):
-        self.generic_visit(node)
-        # Append any helpers that were generated during the walk
-        if self._helper_funcs:
-            node.body.extend(self._helper_funcs)
-        return node
-
-
-def _apply_ast_rules(code: str, module_name: str = "module") -> Tuple[str, List[str]]:
-    """
-    Parse → transform → unparse.  Returns (refactored_code, change_log).
-    Falls back to the original code on any parse / unparse error.
-    """
-    try:
-        tree = ast.parse(code)
-    except SyntaxError as e:
-        return code, [f"AST parse failed: {e}"]
-
-    engine = _ASTRuleEngine(module_name)
-    try:
-        new_tree = engine.visit(tree)
-        ast.fix_missing_locations(new_tree)
-        refactored = ast.unparse(new_tree)
-    except Exception as e:
-        return code, [f"AST transform failed: {e}"]
-
-    # ast.unparse produces compact code — run autopep8-style whitespace fixes
-    # using only stdlib so we never fail on missing deps
-    lines_out: List[str] = []
-    for line in refactored.splitlines():
-        # Ensure two blank lines before top-level def / class
-        if lines_out and line.startswith(("def ", "class ", "async def ")):
-            while lines_out and lines_out[-1].strip() == "":
-                lines_out.pop()
-            lines_out.extend(["", ""])
-        lines_out.append(line)
-
-    return "\n".join(lines_out), engine.change_log
-
-
-def process_ast_refactor(
-    job_id: str, code: str, module_name: str,
-    ollama_url: str, timeout: int,
-):
-    """
-    AST Rule-Engine refactoring job worker.
-    Runs fully deterministically — no LLM calls, no subprocesses.
-    """
-    jobs[job_id].update({
-        "status": "processing", "progress": 0,
-        "phase": "ast", "phase_label": "Parsing AST…",
-    })
-    before = compute_code_metrics(code)
-    jobs[job_id]["before_metrics"] = before
-
-    try:
-        jobs[job_id]["phase_label"] = "Applying AST rules…"
-        jobs[job_id]["progress"] = 20
-
-        refactored, change_log = _apply_ast_rules(code, module_name)
-
-        jobs[job_id]["progress"] = 70
-        jobs[job_id]["phase_label"] = "Computing metrics…"
-
-        after  = compute_code_metrics(refactored)
-        delta  = metrics_delta(before, after)
-        reward = compute_reward(before, after)
-        diff   = unified_diff_str(code, refactored, f"{module_name}.py")
-
-        jobs[job_id].update({
-            "status":         "completed",
-            "progress":       100,
-            "phase":          "done",
-            "phase_label":    "AST refactor complete",
-            "refactored_code": refactored,
-            "summary":        "\n".join(f"• {c}" for c in change_log) if change_log else "No changes applied.",
+            "summary":        "\n".join(f"• {c}" for c in changes) if changes else "No changes applied.",
             "before":         before,
             "after":          after,
             "delta":          delta,
             "reward":         reward,
             "diff":           diff,
-            "changes":        change_log,
-            "message":        f"AST rules applied — {len(change_log)} change(s), reward {reward:.3f}",
+            "changes":        changes,
+            "message":        f"AST rules applied — {len(changes)} change(s), reward {reward:.3f}",
         })
-
     except Exception as e:
         jobs[job_id]["status"] = "error"
         jobs[job_id]["error"]  = str(e)
@@ -3471,37 +2635,25 @@ def process_ast_refactor(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ★  NEW APPROACH 2 — Simulated Annealing Refactor
-#    Probabilistic search over a set of micro-refactoring *actions* applied to
-#    the code.  Each action produces a candidate; the reward function decides
-#    acceptance.  A cooling schedule ensures we explore early and converge late.
-#
-#    Actions (stateless Python code transforms):
-#      A1  LLM-refactor iteration  (same prompt as PPO iter-1)
-#      A2  PEP-8 auto-fix          (via autopep8 if available, else pycodestyle hints)
-#      A3  AST rule pass           (reuses _apply_ast_rules)
-#      A4  Remove blank lines > 2  (cosmetic, fast)
-#      A5  Sort imports            (stdlib before third-party, alphabetical within)
+# Simulated Annealing Refactor
 # ══════════════════════════════════════════════════════════════════════════════
-
-SA_MAX_ITERATIONS    = 8
-SA_INITIAL_TEMP      = 1.0
-SA_COOLING_RATE      = 0.75      # T_{i+1} = T_i * COOLING_RATE
-SA_MIN_TEMP          = 0.05
-SA_REWARD_THRESHOLD  = 0.65      # early-stop if reward reaches this
 
 import math as _math
 import random as _random
 
+SA_MAX_ITERATIONS    = 8
+SA_INITIAL_TEMP      = 1.0
+SA_COOLING_RATE      = 0.75
+SA_MIN_TEMP          = 0.05
+SA_REWARD_THRESHOLD  = 0.65
+
 
 def _sa_action_pep8_fix(code: str) -> str:
-    """Attempt autopep8; fall back to simple whitespace normalisation."""
     try:
         import autopep8  # type: ignore
         return autopep8.fix_code(code, options={"max_line_length": 99, "aggressive": 1})
     except ImportError:
         pass
-    # Fallback: collapse runs of >2 blank lines, strip trailing whitespace
     lines, blanks = [], 0
     for line in code.splitlines():
         stripped = line.rstrip()
@@ -3516,7 +2668,6 @@ def _sa_action_pep8_fix(code: str) -> str:
 
 
 def _sa_action_sort_imports(code: str) -> str:
-    """Sort import statements: stdlib block then third-party, each alphabetical."""
     try:
         tree = ast.parse(code)
     except SyntaxError:
@@ -3540,16 +2691,14 @@ def _sa_action_sort_imports(code: str) -> str:
         if isinstance(node, ast.Import):
             name = node.names[0].name.split(".")[0]
         else:
-            name = (node.module or "").split(".")[0]  # type: ignore[union-attr]
+            name = (node.module or "").split(".")[0]
         tier = 0 if name in stdlib else 1
         return (tier, name)
 
     sorted_imports = sorted([n for _, n in import_nodes], key=_import_key)
 
-    # Rebuild module body: sorted imports first, then everything else in original order
     non_import_positions = [i for i, _ in other_nodes]
     min_non_import = min(non_import_positions) if non_import_positions else len(tree.body)
-    # Only sort if imports come before other statements (avoid reordering guarded imports)
     if any(i < min_non_import for i, _ in import_nodes):
         new_body = sorted_imports + [n for _, n in other_nodes]
         tree.body = new_body
@@ -3561,7 +2710,6 @@ def _sa_action_sort_imports(code: str) -> str:
 
 
 def _sa_action_remove_excess_blanks(code: str) -> str:
-    """Collapse consecutive blank lines > 2 into exactly 2."""
     lines, blanks = [], 0
     for line in code.splitlines():
         if line.strip() == "":
@@ -3578,7 +2726,7 @@ SA_ACTIONS = [
     ("pep8_fix",       _sa_action_pep8_fix),
     ("sort_imports",   _sa_action_sort_imports),
     ("remove_blanks",  _sa_action_remove_excess_blanks),
-    ("ast_rules",      lambda code: _apply_ast_rules(code)[0]),
+    ("ast_rules",      lambda code: apply_ast_rules(code)[0]),
 ]
 
 
@@ -3587,16 +2735,6 @@ def process_sa_refactor(
     ollama_url: str, model: str, timeout: int,
     max_iterations: int = SA_MAX_ITERATIONS,
 ):
-    """
-    Simulated-Annealing refactoring job worker.
-
-    At each iteration we:
-      1. Pick a random action from SA_ACTIONS
-      2. Apply it to produce a candidate
-      3. Compute reward delta
-      4. Accept if better; accept with probability exp(Δ/T) if worse (SA criterion)
-      5. Cool the temperature
-    """
     jobs[job_id].update({
         "status": "processing", "progress": 0,
         "phase": "sa", "phase_label": "Starting SA loop…",
@@ -3620,7 +2758,6 @@ def process_sa_refactor(
             )
             jobs[job_id]["progress"] = int((i - 1) / max_iterations * 90)
 
-            # ── If temperature is still high, also try an LLM action ─────────
             if temperature > 0.4 and i == 1:
                 try:
                     llm_candidate, _ = refactor_code_ollama(
@@ -3635,7 +2772,6 @@ def process_sa_refactor(
                 action_name, fn = _random.choice(SA_ACTIONS)
                 candidate = fn(current)
 
-            # ── Validate candidate is parseable ───────────────────────────────
             try:
                 ast.parse(candidate)
             except SyntaxError:
@@ -3654,7 +2790,6 @@ def process_sa_refactor(
             delta        = metrics_delta(before, after_m)
             reward_delta = new_reward - current_reward
 
-            # ── SA acceptance criterion ───────────────────────────────────────
             if reward_delta > 0:
                 accepted = True
                 reason   = "improvement"
@@ -3723,19 +2858,11 @@ def process_sa_refactor(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ★  NEW APPROACH 3 — RAG-based Refactor
-#    Retrieval-Augmented Generation: build an in-memory vector store of
-#    high-quality Python patterns extracted from the code itself and from a
-#    small built-in corpus of idiomatic snippets.  Retrieve the top-k most
-#    similar patterns, inject them as few-shot examples into the Ollama prompt.
-#
-#    Vector store: TF-IDF cosine similarity (stdlib only — no chromadb/faiss
-#    required).  Falls back to simple keyword overlap if scipy is missing.
+# RAG-based Refactor
 # ══════════════════════════════════════════════════════════════════════════════
 
-RAG_TOP_K = 4   # number of retrieved examples to inject as context
+RAG_TOP_K = 4
 
-# ── Built-in idiomatic snippet corpus ────────────────────────────────────────
 _RAG_CORPUS: List[Dict[str, str]] = [
     {
         "title": "Use enumerate instead of range(len(...))",
@@ -3750,40 +2877,16 @@ _RAG_CORPUS: List[Dict[str, str]] = [
         "tags":   "list comprehension loop",
     },
     {
-        "title": "Use walrus operator to avoid double call",
-        "before": "value = compute()\nif value is not None:\n    use(value)",
-        "after":  "if (value := compute()) is not None:\n    use(value)",
-        "tags":   "walrus operator assignment expression",
-    },
-    {
         "title": "Use dict.get() with default instead of key-in-dict check",
         "before": "if key in d:\n    val = d[key]\nelse:\n    val = default",
         "after":  "val = d.get(key, default)",
         "tags":   "dict get default key",
     },
     {
-        "title": "Use contextlib.suppress instead of try/except/pass",
-        "before": "try:\n    os.remove(path)\nexcept FileNotFoundError:\n    pass",
-        "after":  "from contextlib import suppress\nwith suppress(FileNotFoundError):\n    os.remove(path)",
-        "tags":   "exception suppress contextlib try",
-    },
-    {
-        "title": "Use dataclass instead of plain __init__ with assignments",
-        "before": "class Point:\n    def __init__(self, x, y):\n        self.x = x\n        self.y = y",
-        "after":  "from dataclasses import dataclass\n\n@dataclass\nclass Point:\n    x: float\n    y: float",
-        "tags":   "dataclass class init",
-    },
-    {
-        "title": "Use f-string instead of % or .format()",
-        "before": "msg = 'Hello, %s! You are %d years old.' % (name, age)",
-        "after":  "msg = f'Hello, {name}! You are {age} years old.'",
-        "tags":   "fstring format string",
-    },
-    {
-        "title": "Use isinstance tuple instead of multiple isinstance calls",
-        "before": "if isinstance(x, int) or isinstance(x, float):\n    pass",
-        "after":  "if isinstance(x, (int, float)):\n    pass",
-        "tags":   "isinstance type check",
+        "title": "Add type hints to function signature",
+        "before": "def add(a, b):\n    return a + b",
+        "after":  "def add(a: int | float, b: int | float) -> int | float:\n    return a + b",
+        "tags":   "type hints annotation",
     },
     {
         "title": "Replace mutable default argument with None sentinel",
@@ -3792,31 +2895,15 @@ _RAG_CORPUS: List[Dict[str, str]] = [
         "tags":   "mutable default argument function",
     },
     {
-        "title": "Use any() / all() instead of loop with flag",
-        "before": "found = False\nfor item in items:\n    if condition(item):\n        found = True\n        break",
-        "after":  "found = any(condition(item) for item in items)",
-        "tags":   "any all loop flag boolean",
-    },
-    {
-        "title": "Use pathlib instead of os.path string operations",
-        "before": "path = os.path.join(base_dir, 'data', 'file.txt')",
-        "after":  "from pathlib import Path\npath = Path(base_dir) / 'data' / 'file.txt'",
-        "tags":   "pathlib path os.path",
-    },
-    {
-        "title": "Add type hints to function signature",
-        "before": "def add(a, b):\n    return a + b",
-        "after":  "def add(a: int | float, b: int | float) -> int | float:\n    return a + b",
-        "tags":   "type hints annotation",
+        "title": "Use f-string instead of % or .format()",
+        "before": "msg = 'Hello, %s! You are %d years old.' % (name, age)",
+        "after":  "msg = f'Hello, {name}! You are {age} years old.'",
+        "tags":   "fstring format string",
     },
 ]
 
 
 def _tfidf_vectorize(texts: List[str]) -> Tuple[List[dict], set]:
-    """
-    Minimal TF-IDF implementation using only stdlib.
-    Returns (list of {term: tfidf} dicts, vocabulary set).
-    """
     import math as _m
     tokenize = lambda t: re.findall(r"[a-z_][a-z0-9_]*", t.lower())
     corpus_tokens = [tokenize(t) for t in texts]
@@ -3849,38 +2936,12 @@ def _cosine_sim(a: dict, b: dict) -> float:
     return dot / denom if denom > 0 else 0.0
 
 
-def _extract_code_snippets(code: str) -> List[str]:
-    """
-    Extract top-level function and class bodies from the source as retrieval
-    units so the vector store knows about the code being refactored.
-    """
-    snippets: List[str] = []
-    try:
-        tree = ast.parse(code)
-        for node in tree.body:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                try:
-                    snippets.append(ast.unparse(node))
-                except Exception:
-                    pass
-    except SyntaxError:
-        pass
-    return snippets or [code]
-
-
 def retrieve_similar_patterns(code: str, top_k: int = RAG_TOP_K) -> List[Dict[str, str]]:
-    """
-    Find the top-k corpus entries most similar to the provided code snippet
-    using TF-IDF cosine similarity.
-    """
-    code_snippets = _extract_code_snippets(code)
-    query_text    = " ".join(code_snippets)
-
     corpus_texts = [
         f"{e['title']} {e['tags']} {e['before']} {e['after']}"
         for e in _RAG_CORPUS
     ]
-    all_texts   = corpus_texts + [query_text]
+    all_texts   = corpus_texts + [code]
     vectors, _  = _tfidf_vectorize(all_texts)
     query_vec   = vectors[-1]
     corpus_vecs = vectors[:-1]
@@ -3896,7 +2957,6 @@ def retrieve_similar_patterns(code: str, top_k: int = RAG_TOP_K) -> List[Dict[st
 def _build_rag_prompt(
     code: str, module_name: str, retrieved: List[Dict[str, str]]
 ) -> str:
-    """Build the RAG-augmented refactoring prompt."""
     examples_block = ""
     for idx, ex in enumerate(retrieved, 1):
         examples_block += (
@@ -3937,16 +2997,6 @@ def process_rag_refactor(
     job_id: str, code: str, module_name: str,
     ollama_url: str, model: str, timeout: int,
 ):
-    """
-    RAG-based refactoring job worker.
-
-    Steps:
-      1. Extract code snippets from the source
-      2. Retrieve top-k similar idiomatic patterns via TF-IDF cosine similarity
-      3. Build a few-shot prompt embedding the retrieved examples
-      4. Send to Ollama for LLM-guided refactoring
-      5. Compute metrics and reward
-    """
     jobs[job_id].update({
         "status": "processing", "progress": 0,
         "phase": "rag", "phase_label": "Building retrieval index…",
@@ -3955,20 +3005,17 @@ def process_rag_refactor(
     jobs[job_id]["before_metrics"] = before
 
     try:
-        # ── Phase 1: Retrieval ─────────────────────────────────────────────
         jobs[job_id]["phase_label"] = "Retrieving similar patterns…"
         jobs[job_id]["progress"]    = 15
         retrieved = retrieve_similar_patterns(code, top_k=RAG_TOP_K)
         jobs[job_id]["retrieved_patterns"] = [p["title"] for p in retrieved]
 
-        # ── Phase 2: Augmented generation ─────────────────────────────────
         jobs[job_id]["phase_label"] = f"Generating with {len(retrieved)} retrieved patterns…"
         jobs[job_id]["progress"]    = 35
         prompt    = _build_rag_prompt(code, module_name, retrieved)
         raw       = call_ollama(prompt, ollama_url, model, timeout)
         refactored, summary = _parse_refactor_response(raw, code)
 
-        # ── Phase 3: Metrics ───────────────────────────────────────────────
         jobs[job_id]["phase_label"] = "Computing metrics…"
         jobs[job_id]["progress"]    = 80
         after  = compute_code_metrics(refactored)
@@ -4007,13 +3054,6 @@ def process_rag_refactor(
 
 @app.post("/generate-tests")
 async def generate_tests_endpoint(req: SingleFileRequest):
-    """
-    Single-file test generation.
-    Routes to the correct worker based on req.approach:
-      • "pynguin"  → run selected Pynguin algorithms only
-      • "llm"      → run selected LLM models only
-      • "hybrid"   → run one Pynguin algo + one LLM refiner (default)
-    """
     job_id = str(uuid.uuid4())
     jobs[job_id] = {
         "status": "queued", "submitted_at": time.time(),
@@ -4043,7 +3083,7 @@ async def generate_tests_endpoint(req: SingleFileRequest):
             daemon=True,
         ).start()
 
-    else:  # "hybrid" (default)
+    else:
         threading.Thread(
             target=process_single_file_hybrid,
             args=(
@@ -4109,11 +3149,6 @@ async def refactor_ppo_endpoint(req: RefactorRequest):
 
 @app.post("/refactor-ast")
 async def refactor_ast_endpoint(req: RefactorRequest):
-    """
-    AST rule-engine refactor — deterministic, no LLM required.
-    Applies R2 (unused imports), R4 (bare except), R5 (type hints),
-    R6 (duplicate stmts), R7 (bool simplification), R8 (docstring).
-    """
     job_id = str(uuid.uuid4())
     jobs[job_id] = {
         "status": "queued", "submitted_at": time.time(),
@@ -4129,10 +3164,6 @@ async def refactor_ast_endpoint(req: RefactorRequest):
 
 @app.post("/refactor-sa")
 async def refactor_sa_endpoint(req: RefactorRequest):
-    """
-    Simulated Annealing refactor — stochastic search over atomic code moves.
-    Uses geometric temperature cooling with acceptance probability exp(-ΔE/T).
-    """
     job_id = str(uuid.uuid4())
     jobs[job_id] = {
         "status": "queued", "submitted_at": time.time(),
@@ -4151,11 +3182,6 @@ async def refactor_sa_endpoint(req: RefactorRequest):
 
 @app.post("/refactor-rag")
 async def refactor_rag_endpoint(req: RefactorRequest):
-    """
-    RAG-based refactor — retrieves similar clean-code patterns from a vector
-    store (chromadb + sentence-transformers, with AST-Jaccard fallback) and
-    uses them as few-shot examples in the LLM refactoring prompt.
-    """
     job_id = str(uuid.uuid4())
     jobs[job_id] = {
         "status": "queued", "submitted_at": time.time(),
@@ -4310,7 +3336,6 @@ async def ollama_status(ollama_url: str = "http://localhost:11434"):
 
 @app.get("/check-models")
 async def check_models(ollama_url: str = "http://localhost:11434"):
-    """Returns which refactor models are available in Ollama."""
     try:
         r = requests.get(f"{ollama_url}/api/tags", timeout=5)
         available = [m["name"] for m in r.json().get("models", [])]
@@ -4323,60 +3348,6 @@ async def check_models(ollama_url: str = "http://localhost:11434"):
         return {"models": status, "available": available}
     except Exception as e:
         return {"error": str(e), "models": {m: False for m in REFACTOR_MODELS}}
-
-
-@app.post("/refactor-ast")
-async def refactor_ast_endpoint(req: RefactorRequest):
-    """AST Rule-Engine refactoring — deterministic, no LLM required."""
-    job_id = str(uuid.uuid4())
-    jobs[job_id] = {
-        "status": "queued", "submitted_at": time.time(),
-        "filename": f"{req.module_name}.py", "scope": "ast_refactor",
-    }
-    threading.Thread(
-        target=process_ast_refactor,
-        args=(job_id, req.code, req.module_name, req.ollama_url, req.ollama_timeout),
-        daemon=True,
-    ).start()
-    return {"job_id": job_id, "scope": "ast_refactor"}
-
-
-@app.post("/refactor-sa")
-async def refactor_sa_endpoint(req: RefactorRequest):
-    """Simulated-Annealing refactoring — probabilistic multi-action search."""
-    job_id = str(uuid.uuid4())
-    jobs[job_id] = {
-        "status": "queued", "submitted_at": time.time(),
-        "filename": f"{req.module_name}.py", "scope": "sa_refactor",
-    }
-    threading.Thread(
-        target=process_sa_refactor,
-        args=(
-            job_id, req.code, req.module_name,
-            req.ollama_url, req.ollama_model, req.ollama_timeout,
-        ),
-        daemon=True,
-    ).start()
-    return {"job_id": job_id, "scope": "sa_refactor"}
-
-
-@app.post("/refactor-rag")
-async def refactor_rag_endpoint(req: RefactorRequest):
-    """RAG-based refactoring — retrieves idiomatic patterns as few-shot examples."""
-    job_id = str(uuid.uuid4())
-    jobs[job_id] = {
-        "status": "queued", "submitted_at": time.time(),
-        "filename": f"{req.module_name}.py", "scope": "rag_refactor",
-    }
-    threading.Thread(
-        target=process_rag_refactor,
-        args=(
-            job_id, req.code, req.module_name,
-            req.ollama_url, req.ollama_model, req.ollama_timeout,
-        ),
-        daemon=True,
-    ).start()
-    return {"job_id": job_id, "scope": "rag_refactor"}
 
 
 if __name__ == "__main__":

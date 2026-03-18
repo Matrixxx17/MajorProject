@@ -105,9 +105,9 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
         case "refactorSa":
           await this.handleRefactorSa(msg.filePath, msg.model);
           break;
-        case "refactorRag":
-          await this.handleRefactorRag(msg.filePath, msg.model);
-          break;
+        // case "refactorRag":
+        //   await this.handleRefactorRag(msg.filePath, msg.model);
+        //   break;
         case "refactorSingleModel":
           await this.handleRefactorSingleModel(msg.filePath, msg.model);
           break;
@@ -453,37 +453,37 @@ class TestGeneratorViewProvider implements vscode.WebviewViewProvider {
   }
 
   // ── Refactor: RAG job ────────────────────────────────────────────────────────
-  private async handleRefactorRag(filePath: string, model: string) {
-    try {
-      const moduleName = path.basename(filePath, ".py");
-      const code = Buffer.from(
-        await vscode.workspace.fs.readFile(vscode.Uri.file(filePath)),
-      ).toString("utf8");
-
-      const { data } = await axios.post(
-        `${BACKEND_URL}/refactor-rag`,
-        {
-          code,
-          module_name: moduleName,
-          file_path: filePath,
-          ollama_model: model,
-          ollama_url: "http://localhost:11434",
-          ollama_timeout: 300,
-        },
-        { timeout: 30000 },
-      );
-
-      this._view?.webview.postMessage({
-        type: "ragJobStarted",
-        jobId: data.job_id,
-      });
-    } catch (err) {
-      this._view?.webview.postMessage({
-        type: "ragJobError",
-        error: this.extractError(err),
-      });
-    }
-  }
+  // private async handleRefactorRag(filePath: string, model: string) {
+  //   try {
+  //     const moduleName = path.basename(filePath, ".py");
+  //     const code = Buffer.from(
+  //       await vscode.workspace.fs.readFile(vscode.Uri.file(filePath)),
+  //     ).toString("utf8");
+  //
+  //     const { data } = await axios.post(
+  //       `${BACKEND_URL}/refactor-rag`,
+  //       {
+  //         code,
+  //         module_name: moduleName,
+  //         file_path: filePath,
+  //         ollama_model: model,
+  //         ollama_url: "http://localhost:11434",
+  //         ollama_timeout: 300,
+  //       },
+  //       { timeout: 30000 },
+  //     );
+  //
+  //     this._view?.webview.postMessage({
+  //       type: "ragJobStarted",
+  //       jobId: data.job_id,
+  //     });
+  //   } catch (err) {
+  //     this._view?.webview.postMessage({
+  //       type: "ragJobError",
+  //       error: this.extractError(err),
+  //     });
+  //   }
+  // }
 
   private async handleRefactorMultiModel(filePath: string) {
     try {
@@ -1299,13 +1299,14 @@ body.light .ref-mbtn.cl{border-color:#b45309;color:#92400e;}
     <button class="fc-dismiss" id="ref-dismiss" title="Clear file" onclick="clearRef()">×</button>
   </div>
 
-  <!-- Sub-tabs: Multi-Model vs TRL+PPO vs AST vs SA vs RAG -->
+  <!-- Sub-tabs: Multi-Model vs TRL+PPO vs AST vs SA -->
+  <!-- RAG tab removed -->
   <div class="inner-tabs-wrap">
     <button class="itab on" id="rtab-mm"  onclick="rSwitch('mm',this)">◈ Multi-Model</button>
     <button class="itab"    id="rtab-ppo" onclick="rSwitch('ppo',this)">⟳ TRL+PPO</button>
     <button class="itab"    id="rtab-ast" onclick="rSwitch('ast',this)">⬡ AST Rules</button>
     <button class="itab"    id="rtab-sa"  onclick="rSwitch('sa',this)">❄ Sim. Anneal</button>
-    <button class="itab"    id="rtab-rag" onclick="rSwitch('rag',this)">◉ RAG</button>
+    <!-- <button class="itab"    id="rtab-rag" onclick="rSwitch('rag',this)">◉ RAG</button> -->
   </div>
 
   <!-- ── Multi-Model sub-panel ── -->
@@ -1501,12 +1502,12 @@ body.light .ref-mbtn.cl{border-color:#b45309;color:#92400e;}
     </div>
   </div><!-- /rsp-sa -->
 
-  <!-- ── RAG sub-panel ── -->
+  <!-- ── RAG sub-panel (commented out) ── -->
+  <!--
   <div class="spanel" id="rsp-rag">
     <div style="font-size:9px;color:var(--muted);margin-bottom:10px;padding:6px 9px;background:var(--surf2);border:1px solid var(--bd);border-radius:5px;line-height:1.6;">
       <span style="color:var(--text)">Retrieval-Augmented Generation</span> — queries a local vector store (chromadb + sentence-transformers, or AST-Jaccard fallback) for similar clean-code patterns, then uses them as few-shot examples in the LLM prompt.
     </div>
-    <!-- Model picker for RAG -->
     <div class="model-pick-wrap">
       <div class="model-pick-title">LLM for RAG-guided refactor</div>
       <div class="model-checks">
@@ -1547,7 +1548,9 @@ body.light .ref-mbtn.cl{border-color:#b45309;color:#92400e;}
         <pre class="ref-code-pre" id="rag-code-pre"></pre>
       </div>
     </div>
-  </div><!-- /rsp-rag -->
+  </div>
+  -->
+  <!-- /rsp-rag -->
 
 </div><!-- /mp-refactor -->
 
@@ -1629,11 +1632,11 @@ let saBestCode = null;
 let saSelectedModel = 'deepseek-coder:1.3b';
 let saPollTimer = null;
 
-// RAG state
-let ragRunning = false;
-let ragBestCode = null;
-let ragSelectedModel = 'deepseek-coder:1.3b';
-let ragPollTimer = null;
+// RAG state (commented out)
+// let ragRunning = false;
+// let ragBestCode = null;
+// let ragSelectedModel = 'deepseek-coder:1.3b';
+// let ragPollTimer = null;
 
 /* ══════════════════════════════════════════════
    Connection bar
@@ -2477,10 +2480,11 @@ function clearRef() {
   document.getElementById('sa-stepper').classList.remove('on');
   hideProgress('sa'); setLoader('sa',false); hidePill('sa');
   document.getElementById('btn-sa-run').disabled = true;
-  document.getElementById('rag-metrics-section').classList.remove('on');
-  document.getElementById('rag-code-section').classList.remove('on');
-  hideProgress('rag'); setLoader('rag',false); hidePill('rag');
-  document.getElementById('btn-rag-run').disabled = true;
+  // RAG clear removed (RAG commented out)
+  // document.getElementById('rag-metrics-section').classList.remove('on');
+  // document.getElementById('rag-code-section').classList.remove('on');
+  // hideProgress('rag'); setLoader('rag',false); hidePill('rag');
+  // document.getElementById('btn-rag-run').disabled = true;
 }
 
 /* ══════════════════════════════════════════════
@@ -2629,7 +2633,7 @@ window.addEventListener('message', ev=>{
       if(fp) rd.classList.add('visible'); else rd.classList.remove('visible');
       document.getElementById('btn-mm-run').disabled = !fp;
       updatePpoBtn();
-      updateAstBtn(); updateSaBtn(); updateRagBtn();
+      updateAstBtn(); updateSaBtn(); // updateRagBtn() removed
       break;
     }
 
@@ -2673,7 +2677,7 @@ window.addEventListener('message', ev=>{
       if(scope==='mm_refactor'){  onMmJobStatus(s);  break; }
       if(scope==='ast_refactor'){ onAstJobStatus(s); break; }
       if(scope==='sa_refactor'){  onSaJobStatus(s);  break; }
-      if(scope==='rag_refactor'){ onRagJobStatus(s); break; }
+      // if(scope==='rag_refactor'){ onRagJobStatus(s); break; }  // RAG removed
 
       if(scope==='single') {
         onSingleJobStatus(s);
@@ -2756,15 +2760,16 @@ window.addEventListener('message', ev=>{
       showPill('sa','err',m.error||'SA refactor failed');
       break;
 
-    case 'ragJobStarted':
-      startRagPoll(m.jobId);
-      break;
-    case 'ragJobError':
-      stopRagPoll(); ragRunning=false;
-      setLoader('rag',false); hideProgress('rag');
-      document.getElementById('btn-rag-run').disabled=false;
-      showPill('rag','err',m.error||'RAG refactor failed');
-      break;
+    // RAG job messages commented out
+    // case 'ragJobStarted':
+    //   startRagPoll(m.jobId);
+    //   break;
+    // case 'ragJobError':
+    //   stopRagPoll(); ragRunning=false;
+    //   setLoader('rag',false); hideProgress('rag');
+    //   document.getElementById('btn-rag-run').disabled=false;
+    //   showPill('rag','err',m.error||'RAG refactor failed');
+    //   break;
 
     case 'backendStatus':
       connApiOk=m.apiOk; connOllamaOk=m.ollamaOk;
@@ -2967,93 +2972,93 @@ function saveSaChoice(){
 }
 
 /* ══════════════════════════════════════════════
-   RAG Refactor
+   RAG Refactor (commented out)
 ══════════════════════════════════════════════ */
-function selectRagModel(model,rowEl){
-  ragSelectedModel=model;
-  document.querySelectorAll('[id^="rag-mc-"]').forEach(r=>{
-    r.classList.remove('checked'); r.querySelector('input').checked=false;
-  });
-  rowEl.classList.add('checked'); rowEl.querySelector('input').checked=true;
-}
-function updateRagBtn(){
-  document.getElementById('btn-rag-run').disabled = !refactorPath || ragRunning;
-}
-
-function runRag(){
-  if(!refactorPath){ showPill('rag','err','No Python file open'); return; }
-  if(!connApiOk){ showPill('rag','err','API offline — start the backend first'); return; }
-  ragRunning=true; ragBestCode=null;
-  document.getElementById('btn-rag-run').disabled=true;
-  document.getElementById('rag-metrics-section').classList.remove('on');
-  document.getElementById('rag-code-section').classList.remove('on');
-  document.getElementById('rag-mrows').innerHTML='';
-  document.getElementById('rag-examples-list').innerHTML='';
-  document.getElementById('rag-code-pre').textContent='';
-  hidePill('rag');
-  setLoader('rag',true,'Retrieving similar patterns…');
-  setRefProgress('rag',0,'Starting…');
-  vscode.postMessage({type:'refactorRag',filePath:refactorPath,model:ragSelectedModel});
-}
-
-function startRagPoll(jobId){
-  if(ragPollTimer) clearInterval(ragPollTimer);
-  ragPollTimer=setInterval(()=>vscode.postMessage({type:'pollJob',jobId,scope:'rag_refactor'}),2000);
-}
-function stopRagPoll(){ if(ragPollTimer){clearInterval(ragPollTimer);ragPollTimer=null;} }
-
-function onRagJobStatus(s){
-  if(s.status==='queued'||s.status==='processing'){
-    const pct=s.progress||0;
-    setRefProgress('rag',pct,s.phase_label||'RAG running…');
-    setLoader('rag',true,s.phase_label||'RAG running…');
-  } else { onRagJobDone(s); }
-}
-
-function onRagJobDone(s){
-  stopRagPoll(); ragRunning=false;
-  setLoader('rag',false); hideProgress('rag');
-  document.getElementById('btn-rag-run').disabled=false;
-  if(s.status==='error'){ showPill('rag','err',s.error||'Job failed'); return; }
-  const reward=s.reward!=null?s.reward.toFixed(3):'—';
-  const patterns=s.retrieved_patterns||[];
-  const nEx=s.num_examples_used||patterns.length||0;
-  showPill('rag','ok',nEx+' pattern(s) retrieved — reward: '+reward);
-
-  const exList=document.getElementById('rag-examples-list');
-  if(patterns.length){
-    exList.innerHTML='<strong style="color:var(--text)">Retrieved patterns:</strong><br>'+
-      patterns.map((p,i)=>'&nbsp;'+(i+1)+'. '+esc(typeof p==='string'?p:(p.description||p.title||'unknown'))).join('<br>');
-  } else {
-    exList.innerHTML='';
-  }
-
-  const d=s.delta||{};
-  const fmt=v=>v==null?'—':(v>0?'+':'')+v.toFixed(1);
-  const dc=v=>v==null?'delta-dim':v>0?'delta-pos':v<0?'delta-neg':'delta-neu';
-  const rwCls=s.reward==null?'delta-dim':s.reward>=0.3?'delta-pos':s.reward>=0?'delta-neu':'delta-neg';
-  document.getElementById('rag-mrows').innerHTML=
-    '<div class="ppo-mrow">'+
-    '<span style="font-size:8px;color:var(--accent2)">'+esc(s.embedding_backend||'tfidf')+'</span>'+
-    '<span class="'+dc(d.cyclomatic_delta)+'">'+fmt(d.cyclomatic_delta)+'</span>'+
-    '<span class="'+dc(d.pep8_delta)+'">'+fmt(d.pep8_delta)+'</span>'+
-    '<span class="'+dc(d.halstead_delta)+'">'+fmt(d.halstead_delta)+'</span>'+
-    '<span class="'+dc(d.loc_delta)+'">'+fmt(d.loc_delta)+'</span>'+
-    '<span class="'+rwCls+'">'+reward+'</span>'+
-    '</div>';
-  document.getElementById('rag-metrics-section').classList.add('on');
-
-  if(s.refactored_code){
-    document.getElementById('rag-code-pre').textContent=s.refactored_code;
-    document.getElementById('rag-code-title').textContent='RAG output ('+ragSelectedModel+')';
-    document.getElementById('rag-code-section').classList.add('on');
-    ragBestCode=s.refactored_code;
-  }
-}
-function saveRagChoice(){
-  if(!ragBestCode){ showPill('rag','err','No code to save'); return; }
-  vscode.postMessage({type:'saveRefactored',filePath:refactorPath,code:ragBestCode,model:'rag-'+ragSelectedModel});
-}
+// function selectRagModel(model,rowEl){
+//   ragSelectedModel=model;
+//   document.querySelectorAll('[id^="rag-mc-"]').forEach(r=>{
+//     r.classList.remove('checked'); r.querySelector('input').checked=false;
+//   });
+//   rowEl.classList.add('checked'); rowEl.querySelector('input').checked=true;
+// }
+// function updateRagBtn(){
+//   document.getElementById('btn-rag-run').disabled = !refactorPath || ragRunning;
+// }
+//
+// function runRag(){
+//   if(!refactorPath){ showPill('rag','err','No Python file open'); return; }
+//   if(!connApiOk){ showPill('rag','err','API offline — start the backend first'); return; }
+//   ragRunning=true; ragBestCode=null;
+//   document.getElementById('btn-rag-run').disabled=true;
+//   document.getElementById('rag-metrics-section').classList.remove('on');
+//   document.getElementById('rag-code-section').classList.remove('on');
+//   document.getElementById('rag-mrows').innerHTML='';
+//   document.getElementById('rag-examples-list').innerHTML='';
+//   document.getElementById('rag-code-pre').textContent='';
+//   hidePill('rag');
+//   setLoader('rag',true,'Retrieving similar patterns…');
+//   setRefProgress('rag',0,'Starting…');
+//   vscode.postMessage({type:'refactorRag',filePath:refactorPath,model:ragSelectedModel});
+// }
+//
+// function startRagPoll(jobId){
+//   if(ragPollTimer) clearInterval(ragPollTimer);
+//   ragPollTimer=setInterval(()=>vscode.postMessage({type:'pollJob',jobId,scope:'rag_refactor'}),2000);
+// }
+// function stopRagPoll(){ if(ragPollTimer){clearInterval(ragPollTimer);ragPollTimer=null;} }
+//
+// function onRagJobStatus(s){
+//   if(s.status==='queued'||s.status==='processing'){
+//     const pct=s.progress||0;
+//     setRefProgress('rag',pct,s.phase_label||'RAG running…');
+//     setLoader('rag',true,s.phase_label||'RAG running…');
+//   } else { onRagJobDone(s); }
+// }
+//
+// function onRagJobDone(s){
+//   stopRagPoll(); ragRunning=false;
+//   setLoader('rag',false); hideProgress('rag');
+//   document.getElementById('btn-rag-run').disabled=false;
+//   if(s.status==='error'){ showPill('rag','err',s.error||'Job failed'); return; }
+//   const reward=s.reward!=null?s.reward.toFixed(3):'—';
+//   const patterns=s.retrieved_patterns||[];
+//   const nEx=s.num_examples_used||patterns.length||0;
+//   showPill('rag','ok',nEx+' pattern(s) retrieved — reward: '+reward);
+//
+//   const exList=document.getElementById('rag-examples-list');
+//   if(patterns.length){
+//     exList.innerHTML='<strong style="color:var(--text)">Retrieved patterns:</strong><br>'+
+//       patterns.map((p,i)=>'&nbsp;'+(i+1)+'. '+esc(typeof p==='string'?p:(p.description||p.title||'unknown'))).join('<br>');
+//   } else {
+//     exList.innerHTML='';
+//   }
+//
+//   const d=s.delta||{};
+//   const fmt=v=>v==null?'—':(v>0?'+':'')+v.toFixed(1);
+//   const dc=v=>v==null?'delta-dim':v>0?'delta-pos':v<0?'delta-neg':'delta-neu';
+//   const rwCls=s.reward==null?'delta-dim':s.reward>=0.3?'delta-pos':s.reward>=0?'delta-neu':'delta-neg';
+//   document.getElementById('rag-mrows').innerHTML=
+//     '<div class="ppo-mrow">'+
+//     '<span style="font-size:8px;color:var(--accent2)">'+esc(s.embedding_backend||'tfidf')+'</span>'+
+//     '<span class="'+dc(d.cyclomatic_delta)+'">'+fmt(d.cyclomatic_delta)+'</span>'+
+//     '<span class="'+dc(d.pep8_delta)+'">'+fmt(d.pep8_delta)+'</span>'+
+//     '<span class="'+dc(d.halstead_delta)+'">'+fmt(d.halstead_delta)+'</span>'+
+//     '<span class="'+dc(d.loc_delta)+'">'+fmt(d.loc_delta)+'</span>'+
+//     '<span class="'+rwCls+'">'+reward+'</span>'+
+//     '</div>';
+//   document.getElementById('rag-metrics-section').classList.add('on');
+//
+//   if(s.refactored_code){
+//     document.getElementById('rag-code-pre').textContent=s.refactored_code;
+//     document.getElementById('rag-code-title').textContent='RAG output ('+ragSelectedModel+')';
+//     document.getElementById('rag-code-section').classList.add('on');
+//     ragBestCode=s.refactored_code;
+//   }
+// }
+// function saveRagChoice(){
+//   if(!ragBestCode){ showPill('rag','err','No code to save'); return; }
+//   vscode.postMessage({type:'saveRefactored',filePath:refactorPath,code:ragBestCode,model:'rag-'+ragSelectedModel});
+// }
 
 vscode.postMessage({type:'requestActiveFile'});
 triggerCheck();
