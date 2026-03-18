@@ -74,6 +74,28 @@ PPO_MAX_ITERATIONS   = 5
 PPO_REWARD_THRESHOLD = 0.6
 REWARD_WEIGHTS       = {"cyclomatic": 0.35, "pep8": 0.30, "halstead": 0.20, "loc": 0.15}
 
+# ── FIX 1: Per-model token budgets ─────────────────────────────────────────────
+# Smaller models are faster; larger models need a raised token ceiling but also
+# a tighter cap so they don't run forever on trivial code.
+MODEL_NUM_PREDICT: Dict[str, int] = {
+    "deepseek-coder:1.3b": 1024,   # fast, generous budget
+    "starcoder2:3b":       1024,
+    "codellama:7b":        768,    # slower — keep output shorter
+    "llama3:code":         768,
+}
+DEFAULT_NUM_PREDICT = 1024   # fallback for unknown models
+
+# ── FIX 2: Per-model base timeouts (seconds) ──────────────────────────────────
+# These are MINIMUM timeouts regardless of what the caller requests.
+# Actual timeout = max(caller_timeout, MODEL_BASE_TIMEOUT[model])
+MODEL_BASE_TIMEOUT: Dict[str, int] = {
+    "deepseek-coder:1.3b": 60,
+    "starcoder2:3b":       90,
+    "codellama:7b":        180,   # 7B model is slow on CPU — give it 3 min
+    "llama3:code":         180,
+}
+DEFAULT_BASE_TIMEOUT = 120
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Configuration
@@ -652,6 +674,8 @@ class EnsembleTestGenerator:
         }
         self.timeout_per_model = self.config.get("timeout_per_model", 60)
         self.parallel_execution = self.config.get("parallel_execution", True)
+        # FIX: store ollama_url so _generate_from_model can use the REST API
+        self.ollama_url = self.config.get("ollama_url", "http://localhost:11434")
 
     def generate(self, code: str) -> EnsembleResult:
         start_time = time.time()
@@ -689,44 +713,111 @@ class EnsembleTestGenerator:
     def _generate_sequential(self, code, models):
         return [self._generate_from_model(code, m) for m in models]
 
-    def _generate_from_model(self, code, model):
+    # ── FIX 3: Use REST API instead of CLI subprocess ──────────────────────────
+    def _generate_from_model(self, code: str, model: ModelType) -> ModelResult:
+        """
+        Previously used `subprocess.run(['ollama', 'run', ...])` which:
+          - Spawns a new process (slow startup ~5-10s each call)
+          - Has no keep-alive connection to the Ollama daemon
+          - Doesn't support per-model num_predict limits
+        Now uses the REST API directly (same as call_ollama) with:
+          - Per-model timeout from MODEL_BASE_TIMEOUT
+          - Per-model token budget from MODEL_NUM_PREDICT
+          - Proper JSON body with temperature controls
+        """
         start_time = time.time()
-        prompt = (self._starcoder_prompt(code) if "starcoder2:3b" in model.value
-                  else self._chat_prompt(code))
+        model_name = model.value
+
+        # Resolve effective timeout: caller config OR model-specific minimum
+        effective_timeout = max(
+            self.timeout_per_model,
+            MODEL_BASE_TIMEOUT.get(model_name, DEFAULT_BASE_TIMEOUT),
+        )
+        num_predict = MODEL_NUM_PREDICT.get(model_name, DEFAULT_NUM_PREDICT)
+
+        prompt = self._build_prompt(code, model_name)
+
         try:
-            result = subprocess.run(
-                ["ollama", "run", model.value, prompt],
-                capture_output=True, text=True,
-                timeout=self.timeout_per_model, encoding="utf-8", errors="ignore")
+            response = requests.post(
+                f"{self.ollama_url}/api/generate",
+                json={
+                    "model": model_name,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.2,
+                        "top_p": 0.9,
+                        "num_predict": num_predict,
+                        # FIX: stop tokens prevent the model from rambling
+                        "stop": ["# End of tests", "if __name__"],
+                    },
+                },
+                timeout=effective_timeout,
+            )
+            response.raise_for_status()
+            output = response.json().get("response", "")
             elapsed = time.time() - start_time
-            if result.returncode != 0:
-                return ModelResult(model=model, test_code=None, generation_time=elapsed,
-                                   success=False, error=f"Exit code {result.returncode}")
-            test_code = self._extract_test_code(result.stdout)
+
+            test_code = self._extract_test_code(output)
             if not test_code:
-                return ModelResult(model=model, test_code=None, generation_time=elapsed,
-                                   success=False, error="No valid test code extracted")
-            return ModelResult(model=model, test_code=test_code, generation_time=elapsed,
-                               success=True, num_tests=test_code.count("def test_"),
-                               has_edge_cases=any(k in test_code.lower()
-                                                  for k in ["empty", "none", "null", "invalid", "edge"]))
-        except subprocess.TimeoutExpired:
-            return ModelResult(model=model, test_code=None,
-                               generation_time=time.time() - start_time,
-                               success=False, error=f"Timeout after {self.timeout_per_model}s")
+                return ModelResult(
+                    model=model, test_code=None, generation_time=elapsed,
+                    success=False, error="No valid test code extracted from REST response",
+                )
+
+            return ModelResult(
+                model=model, test_code=test_code, generation_time=elapsed,
+                success=True,
+                num_tests=test_code.count("def test_"),
+                has_edge_cases=any(
+                    k in test_code.lower()
+                    for k in ["empty", "none", "null", "invalid", "edge"]
+                ),
+            )
+
+        except requests.exceptions.Timeout:
+            elapsed = time.time() - start_time
+            return ModelResult(
+                model=model, test_code=None, generation_time=elapsed,
+                success=False,
+                error=f"REST API timeout after {effective_timeout}s for {model_name}",
+            )
+        except requests.exceptions.ConnectionError as e:
+            return ModelResult(
+                model=model, test_code=None, generation_time=time.time() - start_time,
+                success=False, error=f"Cannot connect to Ollama: {e}",
+            )
         except Exception as e:
-            return ModelResult(model=model, test_code=None,
-                               generation_time=time.time() - start_time, success=False, error=str(e))
+            return ModelResult(
+                model=model, test_code=None,
+                generation_time=time.time() - start_time, success=False, error=str(e),
+            )
 
-    def _starcoder_prompt(self, code):
-        return (f"<filename>test_code.py\nimport pytest\nimport sys\n\n{code}\n\n"
-                f"# Write comprehensive pytest test cases:\nimport pytest\n\ndef test_")
-
-    def _chat_prompt(self, code):
-        return (f"You are an expert QA engineer. Generate comprehensive pytest tests.\n\n"
-                f"Requirements:\n1. Cover edge cases\n2. Test happy paths\n"
-                f"3. Test error handling\n4. Return ONLY valid Python in a markdown block\n\n"
-                f"Code:\n{code}\n\nGenerate complete test file:")
+    # ── FIX 4: Unified prompt builder (no more starcoder special-case via CLI) ─
+    def _build_prompt(self, code: str, model_name: str) -> str:
+        """
+        starcoder2 works better with a fill-in-the-middle style prompt.
+        All other models get a standard instruction prompt.
+        The key change: prompts are shorter and more directive to reduce
+        token output volume (which directly cuts latency for large models).
+        """
+        if "starcoder2" in model_name:
+            # starcoder2 understands <fim_prefix>/<fim_suffix>/<fim_middle> tokens
+            return (
+                f"<fim_prefix>import pytest\n\n"
+                f"# Source module under test:\n{code}\n\n"
+                f"# Pytest tests — cover happy paths and edge cases:\n"
+                f"<fim_suffix>\n<fim_middle>"
+            )
+        # Generic instruction prompt — kept deliberately short so the model
+        # doesn't waste tokens on preamble/explanation.
+        return (
+            f"Write pytest tests for this Python code. "
+            f"Output ONLY a valid Python file starting with `import pytest`. "
+            f"Cover happy paths and edge cases. No explanations.\n\n"
+            f"```python\n{code}\n```\n\n"
+            f"import pytest\n"
+        )
 
     def _extract_test_code(self, output):
         ansi = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
@@ -886,12 +977,35 @@ class ProjectContext:
 # Ollama / LLM helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _resolve_timeout(model: str, requested_timeout: int) -> int:
+    """
+    FIX 5: Return the effective timeout — whichever is larger:
+    the caller's requested value or the model's known minimum.
+    This prevents short caller timeouts from cutting off slow models.
+    """
+    return max(requested_timeout, MODEL_BASE_TIMEOUT.get(model, DEFAULT_BASE_TIMEOUT))
+
+
 def call_ollama(prompt: str, ollama_url: str, model: str, timeout: int) -> str:
+    # FIX 6: Use per-model num_predict and resolve effective timeout
+    effective_timeout = _resolve_timeout(model, timeout)
+    num_predict = MODEL_NUM_PREDICT.get(model, DEFAULT_NUM_PREDICT)
+
     response = requests.post(
         f"{ollama_url}/api/generate",
-        json={"model": model, "prompt": prompt, "stream": False,
-              "options": {"temperature": 0.2, "top_p": 0.9, "num_predict": 2048}},
-        timeout=timeout)
+        json={
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": 0.2,
+                "top_p": 0.9,
+                "num_predict": num_predict,       # was hardcoded 2048 — too high for codellama
+                "stop": ["# End", "if __name__"], # prevent runaway generation
+            },
+        },
+        timeout=effective_timeout,
+    )
     response.raise_for_status()
     return response.json().get("response", "")
 
@@ -914,27 +1028,18 @@ def generate_tests_ollama(code, module_name, context="",
                           ollama_url="http://localhost:11434",
                           model="deepseek-coder:1.3b", timeout=120) -> str:
     context_block = f"\n\n# Context from other project files:\n{context}" if context else ""
-    prompt = f"""You are an expert Python test engineer. Write comprehensive pytest tests for the following Python module.
 
-Module name: {module_name}
-
-Source code:
-```python
-{code}{context_block}
-```
-
-Requirements:
-1. Use pytest framework only
-2. Import the module correctly using `from {module_name} import *` or specific imports
-3. Test all public functions and classes
-4. Cover edge cases and boundary conditions
-5. Use descriptive test function names: test_<function>_<scenario>
-6. Add a one-line docstring to each test function
-7. Use pytest.mark.parametrize for similar test cases
-8. Use pytest.raises for exception testing
-9. Return ONLY valid, executable Python — no markdown fences, no explanations
-
-Start your response directly with `import pytest`."""
+    # FIX 7: Shorter, more focused prompt reduces tokens-in AND tokens-out.
+    # The old prompt had 9 numbered requirements which pushed large models to
+    # write verbose preamble before any actual code.
+    prompt = (
+        f"Write pytest tests for the Python module `{module_name}` below. "
+        f"Output ONLY valid Python — no markdown, no explanation. "
+        f"Start with `import pytest`. "
+        f"Cover all public functions, edge cases, and exceptions.\n\n"
+        f"```python\n{code}{context_block}\n```\n\n"
+        f"import pytest\n"
+    )
     raw = call_ollama(prompt, ollama_url, model, timeout)
     return _clean_code(raw)
 
@@ -1104,20 +1209,6 @@ def _parse_mutation_score(output: str) -> float:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _read_pynguin_coverage(out_dir: str, work_dir: str, module_name: str) -> float:
-    """
-    Robustly read the branch/line coverage percentage that Pynguin writes to
-    statistics.csv.
-
-    Search order (most specific → broadest):
-      1. <out_dir>/statistics.csv              (Pynguin ≥ 0.35 default location)
-      2. <out_dir>/pynguin-report/statistics.csv
-      3. <work_dir>/statistics.csv
-      4. Walk the entire work_dir looking for any statistics.csv
-      5. Return 0.0 if nothing found
-
-    Column-name candidates tried (case-insensitive):
-      "Coverage", "BranchCoverage", "LineCoverage", "coverage_percent"
-    """
     import csv as _csv
 
     COVERAGE_COLS = [
@@ -1132,7 +1223,6 @@ def _read_pynguin_coverage(out_dir: str, work_dir: str, module_name: str) -> flo
         os.path.join(work_dir, "pynguin-report", "statistics.csv"),
     ]
 
-    # Also walk the whole work_dir to catch wherever Pynguin drops the file
     for root, dirs, files in os.walk(work_dir):
         for fname in files:
             if fname == "statistics.csv":
@@ -1147,7 +1237,6 @@ def _read_pynguin_coverage(out_dir: str, work_dir: str, module_name: str) -> flo
             with open(csv_path, newline="", encoding="utf-8") as fh:
                 raw = fh.read()
 
-            # Strip ANSI escape codes that Pynguin sometimes writes
             ansi = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
             raw = ansi.sub("", raw)
 
@@ -1155,10 +1244,8 @@ def _read_pynguin_coverage(out_dir: str, work_dir: str, module_name: str) -> flo
             if not reader.fieldnames:
                 continue
 
-            # Build a case-insensitive field map
             field_map = {f.strip().strip('"').lower(): f for f in reader.fieldnames}
 
-            # Find which coverage column exists
             cov_col = None
             for candidate in COVERAGE_COLS:
                 if candidate.lower() in field_map:
@@ -1166,7 +1253,6 @@ def _read_pynguin_coverage(out_dir: str, work_dir: str, module_name: str) -> flo
                     break
 
             if cov_col is None:
-                # Last resort: any column with "coverage" in its name
                 for f in reader.fieldnames:
                     if "coverage" in f.lower():
                         cov_col = f
@@ -1175,19 +1261,17 @@ def _read_pynguin_coverage(out_dir: str, work_dir: str, module_name: str) -> flo
             if cov_col is None:
                 continue
 
-            # Find the best matching row for this module
             rows = list(reader)
             if not rows:
                 continue
 
-            # Try to match by TargetModule / module_name column
             target_col = None
             for f in reader.fieldnames:
                 if f.strip().strip('"').lower() in ("targetmodule", "module", "module_name", "target_module"):
                     target_col = f
                     break
 
-            matching_rows = rows  # default: use all rows
+            matching_rows = rows
             if target_col:
                 matched = [
                     r for r in rows
@@ -1196,20 +1280,16 @@ def _read_pynguin_coverage(out_dir: str, work_dir: str, module_name: str) -> flo
                 if matched:
                     matching_rows = matched
 
-            # Use the last row (most recent run)
             row = matching_rows[-1]
             raw_val = row.get(cov_col, "").strip().strip('"')
             if not raw_val:
                 continue
 
             val = float(raw_val)
-
-            # Pynguin may write the value as 0–1 fraction or 0–100 percentage
-            # Values > 1.0 are already percentages; ≤ 1.0 are fractions
             if val <= 1.0:
-                return val          # already a fraction (0.0 – 1.0)
+                return val
             else:
-                return val / 100.0  # convert percentage to fraction
+                return val / 100.0
 
         except Exception as exc:
             print(f"[coverage] Failed to parse {csv_path}: {exc}")
@@ -1337,12 +1417,8 @@ def _run_pynguin_algorithm(
         result["num_tests"] = raw_tests.count("def test_")
         result["status"] = "success"
 
-        # ── Coverage: use the robust multi-path reader ────────────────────
-        # Pass both out_dir (where Pynguin wrote) and work_dir (parent) so
-        # the reader can find statistics.csv wherever Pynguin placed it.
         cov = _read_pynguin_coverage(out_dir, work_dir, module_name)
 
-        # ── Fallback: run pytest-cov if Pynguin stats gave 0 ─────────────
         if cov == 0.0:
             mdir = tempfile.mkdtemp(prefix=f"codexter_cov_{algorithm}_")
             try:
@@ -1360,7 +1436,6 @@ def _run_pynguin_algorithm(
             finally:
                 shutil.rmtree(mdir, ignore_errors=True)
 
-        # ── Mutation score ────────────────────────────────────────────────
         mdir = tempfile.mkdtemp(prefix=f"codexter_{algorithm}_")
         try:
             shutil.copy(src_path, os.path.join(mdir, f"{module_name}.py"))
@@ -1585,10 +1660,13 @@ def _run_llm_model_for_tests(
         "error":          None,
     }
 
+    # FIX 8: Always use the effective (model-aware) timeout here too
+    effective_timeout = _resolve_timeout(model, timeout)
+
     try:
         raw_tests = generate_tests_ollama(
             code=code, module_name=module_name,
-            ollama_url=ollama_url, model=model, timeout=timeout,
+            ollama_url=ollama_url, model=model, timeout=effective_timeout,
         )
 
         if not raw_tests or not raw_tests.strip():
@@ -1661,8 +1739,14 @@ def process_single_file_llm(
         model_results: List[dict] = []
 
         for idx, model in enumerate(models):
-            jobs[job_id]["phase_label"] = f"Running {model} ({idx+1}/{len(models)})…"
-            jobs[job_id]["progress"]    = 5 + int(idx / len(models) * 85)
+            # FIX 9: Show the effective timeout in the progress label so users
+            # know the system is respecting CodeLlama's longer generation time.
+            eff_t = _resolve_timeout(model, timeout)
+            jobs[job_id]["phase_label"] = (
+                f"Running {model} ({idx+1}/{len(models)})… "
+                f"[timeout: {eff_t}s]"
+            )
+            jobs[job_id]["progress"] = 5 + int(idx / len(models) * 85)
 
             r = _run_llm_model_for_tests(
                 model=model, code=code, module_name=module_name,
@@ -1766,7 +1850,11 @@ def process_single_file_hybrid(
         jobs[job_id]["progress"]     = 60
 
         jobs[job_id]["phase"]       = "refining"
-        jobs[job_id]["phase_label"] = f"Refining with {hybrid_llm}…"
+        # FIX 10: Use effective timeout for the hybrid LLM refinement step too
+        effective_llm_timeout = _resolve_timeout(hybrid_llm, timeout)
+        jobs[job_id]["phase_label"] = (
+            f"Refining with {hybrid_llm}… [timeout: {effective_llm_timeout}s]"
+        )
 
         refinement = _refine_tests_with_llm(
             algo_results=[algo_result],
@@ -1774,7 +1862,7 @@ def process_single_file_hybrid(
             module_name=module_name,
             ollama_url=ollama_url,
             model=hybrid_llm,
-            timeout=timeout,
+            timeout=effective_llm_timeout,
         )
         jobs[job_id]["progress"]   = 90
         jobs[job_id]["refinement"] = refinement
@@ -1916,9 +2004,11 @@ def _process_one_file(
 
         if not tests:
             generation_method = "single_model"
+            # FIX 11: Pass effective timeout so codellama gets its minimum
+            effective_timeout = _resolve_timeout(model, timeout)
             tests = generate_tests_ollama(
                 code=code, module_name=module_name, context=context,
-                ollama_url=ollama_url, model=model, timeout=timeout)
+                ollama_url=ollama_url, model=model, timeout=effective_timeout)
 
         if not tests or not tests.strip():
             tests = fallback_simple_tests(code, module_name)
@@ -2722,11 +2812,11 @@ def _sa_action_remove_excess_blanks(code: str) -> str:
     return "\n".join(lines)
 
 
+# AFTER — remove ast_rules from the static list entirely
 SA_ACTIONS = [
-    ("pep8_fix",       _sa_action_pep8_fix),
-    ("sort_imports",   _sa_action_sort_imports),
-    ("remove_blanks",  _sa_action_remove_excess_blanks),
-    ("ast_rules",      lambda code: apply_ast_rules(code)[0]),
+    ("pep8_fix",      _sa_action_pep8_fix),
+    ("sort_imports",  _sa_action_sort_imports),
+    ("remove_blanks", _sa_action_remove_excess_blanks),
 ]
 
 
@@ -2751,6 +2841,11 @@ def process_sa_refactor(
     temperature  = SA_INITIAL_TEMP
     log: List[dict] = []
 
+    # ── FIX: build actions locally so ast_rules can close over module_name ──
+    local_actions = SA_ACTIONS + [
+        ("ast_rules", lambda c: apply_ast_rules(c, module_name)[0]),
+    ]
+
     try:
         for i in range(1, max_iterations + 1):
             jobs[job_id]["phase_label"] = (
@@ -2766,10 +2861,10 @@ def process_sa_refactor(
                     action_name = "llm_refactor"
                     candidate   = llm_candidate
                 except Exception:
-                    action_name, fn = _random.choice(SA_ACTIONS)
+                    action_name, fn = _random.choice(local_actions)
                     candidate = fn(current)
             else:
-                action_name, fn = _random.choice(SA_ACTIONS)
+                action_name, fn = _random.choice(local_actions)
                 candidate = fn(current)
 
             try:
